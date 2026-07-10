@@ -16,92 +16,140 @@ function mockProcessor(name: string): Processor {
   };
 }
 
-describe("Router.parse", () => {
-  it("parses builtin commands", () => {
+describe("Router.parse — # prefix rules", () => {
+  it("parses builtin commands with trailing space", () => {
     const router = new Router();
-    const result = router.parse("/clear");
-    expect(result).toEqual({ type: "command", command: "clear", args: "" });
+    expect(router.parse("#clear ")).toEqual({
+      type: "command", command: "clear", args: "",
+    });
   });
 
   it("parses builtin command with args", () => {
     const router = new Router();
-    const result = router.parse("/help details");
-    expect(result).toEqual({ type: "command", command: "help", args: "details" });
-  });
-
-  it("parses prefix route with message", () => {
-    const router = new Router();
-    router.registerProcessor(mockProcessor("asset"), { prefix: "/asset" });
-    const result = router.parse("/asset 查查我的资产");
-    expect(result).toEqual({
-      type: "message",
-      processor: "asset",
-      text: "查查我的资产",
+    expect(router.parse("#help details")).toEqual({
+      type: "command", command: "help", args: "details",
     });
   });
 
-  it("parses prefix route without message", () => {
+  it("parses processor prefix with message", () => {
     const router = new Router();
-    router.registerProcessor(mockProcessor("asset"), { prefix: "/asset" });
-    const result = router.parse("/asset");
-    expect(result).toEqual({
-      type: "message",
-      processor: "asset",
-      text: undefined,
+    router.registerProcessor(mockProcessor("asset"), { prefix: "#asset" });
+    expect(router.parse("#asset 查查我的资产")).toEqual({
+      type: "message", processor: "asset", text: "查查我的资产",
     });
   });
 
-  it("parses plain text as message", () => {
+  it("parses processor prefix with newline separator", () => {
     const router = new Router();
-    const result = router.parse("hello world");
-    expect(result).toEqual({ type: "message", text: "hello world" });
+    router.registerProcessor(mockProcessor("asset"), { prefix: "#asset" });
+    expect(router.parse("#asset\n查查我的资产")).toEqual({
+      type: "message", processor: "asset", text: "查查我的资产",
+    });
   });
 
-  it("treats unknown slash as plain text", () => {
+  it("parses processor prefix with only trailing space (switch only)", () => {
     const router = new Router();
-    const result = router.parse("/unknown command");
-    expect(result).toEqual({ type: "message", text: "/unknown command" });
+    router.registerProcessor(mockProcessor("asset"), { prefix: "#asset" });
+    expect(router.parse("#asset ")).toEqual({
+      type: "message", processor: "asset", text: undefined,
+    });
   });
 
-  it("is case insensitive for prefixes", () => {
+  it("treats #word without trailing space as plain text", () => {
     const router = new Router();
-    router.registerProcessor(mockProcessor("asset"), { prefix: "/asset" });
-    const result = router.parse("/Asset 查查");
-    expect(result.processor).toBe("asset");
+    router.registerProcessor(mockProcessor("asset"), { prefix: "#asset" });
+    expect(router.parse("#asset")).toEqual({
+      type: "message", text: "#asset",
+    });
+  });
+
+  it("treats #word joined with other text as plain text", () => {
+    const router = new Router();
+    router.registerProcessor(mockProcessor("asset"), { prefix: "#asset" });
+    expect(router.parse("#asset123")).toEqual({
+      type: "message", text: "#asset123",
+    });
+  });
+
+  it("allows leading whitespace before #", () => {
+    const router = new Router();
+    router.registerProcessor(mockProcessor("asset"), { prefix: "#asset" });
+    expect(router.parse("  #asset 查查")).toEqual({
+      type: "message", processor: "asset", text: "查查",
+    });
+  });
+
+  it("rejects non-whitespace characters before #", () => {
+    const router = new Router();
+    router.registerProcessor(mockProcessor("asset"), { prefix: "#asset" });
+    expect(router.parse("hello #asset 查查")).toEqual({
+      type: "message", text: "hello #asset 查查",
+    });
+  });
+
+  it("rejects space between # and word", () => {
+    const router = new Router();
+    router.registerProcessor(mockProcessor("asset"), { prefix: "#asset" });
+    expect(router.parse("# asset 查查")).toEqual({
+      type: "message", text: "# asset 查查",
+    });
+  });
+
+  it("is case insensitive for command names", () => {
+    const router = new Router();
+    router.registerProcessor(mockProcessor("asset"), { prefix: "#asset" });
+    expect(router.parse("#Asset 查查")).toMatchObject({
+      processor: "asset",
+    });
+  });
+
+  it("treats unknown # prefix as plain text", () => {
+    const router = new Router();
+    expect(router.parse("#unknown 查查")).toEqual({
+      type: "message", text: "#unknown 查查",
+    });
+  });
+
+  it("parses plain text without # as message", () => {
+    const router = new Router();
+    expect(router.parse("hello world")).toEqual({
+      type: "message", text: "hello world",
+    });
+  });
+
+  it("strips the #command header from forwarded text", () => {
+    const router = new Router();
+    router.registerProcessor(mockProcessor("asset"), { prefix: "#asset" });
+    const result = router.parse("#asset 查查我的资产");
+    expect(result.text).toBe("查查我的资产");
+    expect(result.text).not.toContain("#asset");
   });
 });
 
 describe("Router.resolve (sticky routing)", () => {
   it("resolves to default when no active processor", () => {
     const router = new Router();
-    const claude = mockProcessor("claude");
-    router.registerProcessor(claude, { isDefault: true });
-
-    const parsed = router.parse("hello");
-    const resolved = router.resolve("user1", parsed);
+    router.registerProcessor(mockProcessor("claude"), { isDefault: true });
+    const resolved = router.resolve("user1", router.parse("hello"));
     expect(resolved?.name).toBe("claude");
   });
 
   it("sticks to explicitly selected processor", () => {
     const router = new Router();
     router.registerProcessor(mockProcessor("claude"), { isDefault: true });
-    router.registerProcessor(mockProcessor("asset"), { prefix: "/asset" });
+    router.registerProcessor(mockProcessor("asset"), { prefix: "#asset" });
 
-    const parsed1 = router.parse("/asset 查查");
-    router.resolve("user1", parsed1);
-
-    const parsed2 = router.parse("那黄金呢");
-    const resolved = router.resolve("user1", parsed2);
+    router.resolve("user1", router.parse("#asset 查查"));
+    const resolved = router.resolve("user1", router.parse("那黄金呢"));
     expect(resolved?.name).toBe("asset");
   });
 
   it("isolates routing per chat_id", () => {
     const router = new Router();
     router.registerProcessor(mockProcessor("claude"), { isDefault: true });
-    router.registerProcessor(mockProcessor("asset"), { prefix: "/asset" });
+    router.registerProcessor(mockProcessor("asset"), { prefix: "#asset" });
 
-    router.resolve("user1", router.parse("/asset 查查"));
-
+    router.resolve("user1", router.parse("#asset 查查"));
     const resolved = router.resolve("user2", router.parse("hello"));
     expect(resolved?.name).toBe("claude");
   });
@@ -109,9 +157,9 @@ describe("Router.resolve (sticky routing)", () => {
   it("switchTo changes active processor", () => {
     const router = new Router();
     router.registerProcessor(mockProcessor("claude"), { isDefault: true });
-    router.registerProcessor(mockProcessor("asset"), { prefix: "/asset" });
+    router.registerProcessor(mockProcessor("asset"), { prefix: "#asset" });
 
-    router.resolve("user1", router.parse("/asset test"));
+    router.resolve("user1", router.parse("#asset test"));
     expect(router.getActive("user1")).toBe("asset");
 
     router.switchTo("user1", "claude");
@@ -128,7 +176,7 @@ describe("Router.listProcessors", () => {
   it("lists registered processors", () => {
     const router = new Router();
     router.registerProcessor(mockProcessor("claude"), { isDefault: true });
-    router.registerProcessor(mockProcessor("asset"), { prefix: "/asset" });
+    router.registerProcessor(mockProcessor("asset"), { prefix: "#asset" });
     expect(router.listProcessors()).toEqual(["claude", "asset"]);
   });
 });

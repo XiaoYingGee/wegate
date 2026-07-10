@@ -30,7 +30,7 @@ export function loadConfig(): WegateConfig {
     processors.push({
       name: "asset",
       type: "http",
-      prefix: "/asset",
+      prefix: "#asset",
       url: process.env.WEGATE_ASSET_URL,
     });
   }

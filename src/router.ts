@@ -2,6 +2,15 @@ import type { Processor, RouteResult } from "./types.js";
 
 const BUILTIN_COMMANDS = new Set(["clear", "claude", "help", "status"]);
 
+// Matches: optional leading whitespace, #word, then at least one whitespace or end of string.
+// Captures: (1) command name, (2) remaining text after the whitespace (may be empty/undefined).
+// Rules:
+//   - No non-whitespace characters before #
+//   - # must be immediately followed by letters (no space)
+//   - At least one space or newline after #word to be valid
+//   - #word at end of string without trailing space is NOT a command (treated as plain text)
+const HASH_CMD_RE = /^\s*#([a-zA-Z]\w*)(?:\s+([\s\S]*)|\s+)$/;
+
 export class Router {
   private processors = new Map<string, Processor>();
   private prefixMap = new Map<string, string>();
@@ -14,7 +23,8 @@ export class Router {
   ) {
     this.processors.set(processor.name, processor);
     if (opts?.prefix) {
-      this.prefixMap.set(opts.prefix.toLowerCase(), processor.name);
+      const normalized = opts.prefix.replace(/^#/, "").toLowerCase();
+      this.prefixMap.set(normalized, processor.name);
     }
     if (opts?.isDefault) {
       this.defaultName = processor.name;
@@ -22,29 +32,25 @@ export class Router {
   }
 
   parse(text: string): RouteResult {
-    const trimmed = text.trim();
+    const match = text.match(HASH_CMD_RE);
+    if (match) {
+      const name = match[1].toLowerCase();
+      const body = match[2]?.trim() || undefined;
 
-    if (trimmed.startsWith("/")) {
-      const spaceIdx = trimmed.indexOf(" ");
-      const cmd = (spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx))
-        .toLowerCase();
-      const args = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
-
-      if (BUILTIN_COMMANDS.has(cmd.slice(1))) {
-        return { type: "command", command: cmd.slice(1), args };
+      if (BUILTIN_COMMANDS.has(name)) {
+        return { type: "command", command: name, args: body || "" };
       }
 
-      if (this.prefixMap.has(cmd)) {
-        const processorName = this.prefixMap.get(cmd)!;
+      if (this.prefixMap.has(name)) {
         return {
           type: "message",
-          processor: processorName,
-          text: args || undefined,
+          processor: this.prefixMap.get(name)!,
+          text: body,
         };
       }
     }
 
-    return { type: "message", text: trimmed };
+    return { type: "message", text: text.trim() };
   }
 
   resolve(chatId: string, parsed: RouteResult): Processor | undefined {

@@ -108,14 +108,14 @@ async function handleCommand(
   switch (command) {
     case "help": {
       const lines = [
-        "Wegate 命令:",
-        "  /help — 显示此帮助",
-        "  /status — 当前状态",
-        "  /claude — 切回 Claude Code",
-        "  /clear — 重置当前处理器的会话",
+        "Wegate 命令（#号开头，后接空格）:",
+        "  #help — 显示此帮助",
+        "  #status — 当前状态",
+        "  #claude — 切回 Claude Code",
+        "  #clear — 重置当前处理器的会话",
         ...Array.from(new Set(router.listProcessors()))
           .filter((n) => n !== "claude")
-          .map((n) => `  /${n} — 切换到 ${n}`),
+          .map((n) => `  #${n} <消息> — 切换到 ${n}`),
       ];
       await reply(client, store, chatId, lines.join("\n"));
       break;
