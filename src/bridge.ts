@@ -64,7 +64,7 @@ export async function ensureLogin(
   throw new Error("登录超时");
 }
 
-export type MessageHandler = (from: string, text: string, msg: WeixinMessage) => void;
+export type MessageHandler = (from: string, text: string, msg: WeixinMessage) => Promise<void> | void;
 
 export async function startMessageLoop(
   client: ILinkClient,
@@ -102,7 +102,11 @@ export async function startMessageLoop(
           await store.save();
 
           const text = extractText(msg);
-          onMessage(from, text, msg);
+          try {
+            await onMessage(from, text, msg);
+          } catch (err) {
+            logError(`消息处理异常 [${from}]:`, err);
+          }
         }
       }
     } catch (err) {

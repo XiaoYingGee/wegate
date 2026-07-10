@@ -1,13 +1,15 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import type { Processor, ProcessorResponse } from "../types.js";
 
 export class ClaudeCodeProcessor implements Processor {
-  readonly name = "claude";
+  readonly name: string;
   private command: string;
   private sessions = new Map<string, string>();
+  private activeChildren = new Set<ChildProcess>();
 
-  constructor(command = "claude") {
+  constructor(command = "claude", name = "claude") {
     this.command = command;
+    this.name = name;
   }
 
   async send(message: string, chatId: string): Promise<ProcessorResponse> {
@@ -38,6 +40,10 @@ export class ClaudeCodeProcessor implements Processor {
 
   async dispose(): Promise<void> {
     this.sessions.clear();
+    for (const child of this.activeChildren) {
+      child.kill("SIGTERM");
+    }
+    this.activeChildren.clear();
   }
 
   private exec(
@@ -50,21 +56,30 @@ export class ClaudeCodeProcessor implements Processor {
         env: { ...process.env },
       });
 
+      this.activeChildren.add(child);
+
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
 
       child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
       child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
 
-      child.on("error", (err) => reject(err));
+      child.on("error", (err) => {
+        this.activeChildren.delete(child);
+        reject(err);
+      });
 
       child.on("close", (code) => {
+        this.activeChildren.delete(child);
         const out = Buffer.concat(stdout).toString("utf-8").trim();
         const errOut = Buffer.concat(stderr).toString("utf-8").trim();
 
-        if (code !== 0 && !out) {
-          reject(new Error(errOut || `exit code ${code}`));
-          return;
+        if (code !== 0) {
+          if (!out) {
+            reject(new Error(errOut || `exit code ${code}`));
+            return;
+          }
+          console.error(`[claude] 非零退出码 ${code}: ${errOut.slice(0, 200)}`);
         }
 
         let sessionId: string | undefined;

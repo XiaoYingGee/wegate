@@ -6,7 +6,7 @@ import { ClaudeCodeProcessor } from "./processors/claude.js";
 import { HttpProcessor } from "./processors/http.js";
 import { ensureLogin, startMessageLoop } from "./bridge.js";
 import { startApiServer } from "./api.js";
-import { loadConfig } from "./types.js";
+import { loadConfig } from "./config.js";
 
 const log = (msg: string, ...args: unknown[]) =>
   console.log(`[wegate] ${msg}`, ...args);
@@ -27,11 +27,11 @@ async function main(): Promise<void> {
   // 2. Register processors
   for (const pc of config.processors) {
     if (pc.type === "claude") {
-      router.registerProcessor(new ClaudeCodeProcessor(pc.command), {
+      router.registerProcessor(new ClaudeCodeProcessor(pc.command, pc.name), {
         prefix: pc.prefix,
         isDefault: pc.default,
       });
-    } else if (pc.type === "http" && pc.url) {
+    } else if (pc.type === "http") {
       router.registerProcessor(new HttpProcessor(pc.name, pc.url), {
         prefix: pc.prefix,
         isDefault: pc.default,
@@ -42,9 +42,20 @@ async function main(): Promise<void> {
   log(`已注册 ${router.listProcessors().length} 个处理器: ${router.listProcessors().join(", ")}`);
 
   // 3. Start API server
-  startApiServer({ client, store, router }, config.apiHost, config.apiPort);
+  const server = startApiServer({ client, store, router }, config.apiHost, config.apiPort);
 
-  // 4. Start message loop
+  // 4. Graceful shutdown
+  const shutdown = async () => {
+    log("正在关闭...");
+    server.close();
+    await router.dispose();
+    await store.save();
+    process.exit(0);
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+
+  // 5. Start message loop
   startMessageLoop(client, store, async (from, text) => {
     log(`← [${from}] ${text}`);
 
@@ -61,7 +72,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    const msgText = parsed.text || text;
+    const msgText = parsed.text;
     if (!msgText) {
       const active = router.getActive(from);
       await reply(client, store, from, `已切换到 ${active}`);
@@ -160,18 +171,22 @@ async function reply(
     return;
   }
 
-  const maxLen = 2000;
-  if (text.length <= maxLen) {
-    await client.sendText(to, text, token);
-    log(`→ [${to}] ${text.slice(0, 80)}${text.length > 80 ? "..." : ""}`);
-    return;
-  }
+  try {
+    const maxLen = 2000;
+    if (text.length <= maxLen) {
+      await client.sendText(to, text, token);
+      log(`→ [${to}] ${text.slice(0, 80)}${text.length > 80 ? "..." : ""}`);
+      return;
+    }
 
-  for (let i = 0; i < text.length; i += maxLen) {
-    const chunk = text.slice(i, i + maxLen);
-    await client.sendText(to, chunk, token);
+    for (let i = 0; i < text.length; i += maxLen) {
+      const chunk = text.slice(i, i + maxLen);
+      await client.sendText(to, chunk, token);
+    }
+    log(`→ [${to}] (${Math.ceil(text.length / maxLen)} 条分段消息)`);
+  } catch (err) {
+    logError(`回复发送失败 [${to}]:`, err);
   }
-  log(`→ [${to}] (${Math.ceil(text.length / maxLen)} 条分段消息)`);
 }
 
 main().catch((err) => {

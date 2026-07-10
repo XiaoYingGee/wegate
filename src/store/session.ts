@@ -55,10 +55,22 @@ export class SessionStore {
     }
   }
 
+  private saving: Promise<void> | null = null;
+
   async save(): Promise<void> {
+    while (this.saving) await this.saving;
+    this.saving = this.doSave();
+    try {
+      await this.saving;
+    } finally {
+      this.saving = null;
+    }
+  }
+
+  private async doSave(): Promise<void> {
     this.data.saved_at = new Date().toISOString();
     await mkdir(dirname(this.path), { recursive: true });
-    const tmp = this.path + ".tmp";
+    const tmp = `${this.path}.${process.pid}.tmp`;
     await writeFile(tmp, JSON.stringify(this.data, null, 2), { mode: 0o600 });
     const { rename } = await import("node:fs/promises");
     await rename(tmp, this.path);
