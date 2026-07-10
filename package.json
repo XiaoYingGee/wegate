@@ -1,0 +1,31 @@
+{
+  "name": "wegate",
+  "version": "0.1.0",
+  "description": "Personal WeChat message gateway via official iLink API",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "wegate": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "wechat",
+    "gateway",
+    "ilink",
+    "notification"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0"
+  }
+}

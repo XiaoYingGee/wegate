@@ -1,0 +1,11 @@
+services:
+  wegate:
+    build: .
+    container_name: wegate
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./data:/app/data
+    environment:
+      - WEGATE_DATA_DIR=/app/data
