@@ -9,61 +9,134 @@ Wegate lets you **send and receive WeChat messages** programmatically through Te
 - **QR code login** — scan once, session persists across restarts
 - **Receive messages** — long-polling with automatic `context_token` capture
 - **Send messages** — proactive push to any contact who messaged you first
-- **Docker ready** — one command to deploy, volume-mounted session persistence
+- **Sticky routing** — prefix commands (`/asset`, `/claude`) switch between processors, plain text follows the last used one
+- **Claude Code integration** — default processor spawns Claude Code CLI with session resume
+- **HTTP processors** — route messages to any HTTP backend (asset management, etc.)
+- **Push API** — `POST /api/send` lets external services push notifications to WeChat
+- **systemd ready** — runs as a daemon on your server
 
 ## Quick Start
 
 ```bash
-# Clone and install
 git clone https://github.com/XiaoYingGee/wegate.git
-cd wegate && npm install
+cd wegate && npm install && npm run build
 
-# Run (displays QR code in terminal, scan with WeChat)
-npm run dev
+# First run — displays QR code in terminal, scan with WeChat
+npm start
 ```
 
-### Docker
-
-```bash
-docker compose up -d
-docker attach wegate  # scan QR code, then detach with Ctrl+P Ctrl+Q
-```
-
-Session data is persisted in `./data/` (gitignored).
-
-## How It Works
+## Architecture
 
 ```
-WeChat User ←→ iLink API ←→ Wegate (long-poll loop) ←→ Your Services
+WeChat ←→ iLink API ←→ Bridge (long-poll) ←→ Router ←→ Processors
+                                                │
+                                          API Server ←→ External Services
 ```
 
-1. **Login**: Wegate fetches a QR code from iLink API, you scan it with WeChat
-2. **Receive**: Long-polling `getUpdates` captures incoming messages and their `context_token`
-3. **Send**: Using the captured `context_token`, Wegate can send messages back via `sendMessage`
+### Message Flow
 
-> **Important**: You must receive at least one message from a contact before you can send to them — this is an iLink API constraint, not a Wegate limitation.
+```
+Inbound:  WeChat user sends "查查我的资产"
+          → Bridge receives via getUpdates
+          → Router parses prefix, resolves processor
+          → Processor.send(message, chatId)
+          → Response sent back via sendMessage
+
+Outbound: External service POSTs to /api/send
+          → API Server sends via iLink sendMessage
+          → WeChat user receives notification
+```
+
+### Sticky Routing
+
+```
+/asset 查查我的资产     →  active = asset, forwards to asset processor
+那黄金呢               →  still goes to asset (sticky)
+/claude                →  active = claude, resumes previous session
+帮我看看这个函数        →  goes to Claude Code
+/clear                 →  resets current processor's session
+```
 
 ## Configuration
 
-| Env Variable | Default | Description |
+All config via environment variables:
+
+| Variable | Default | Description |
 |---|---|---|
-| `WEGATE_DATA_DIR` | `./data` | Directory for session persistence |
+| `WEGATE_DATA_DIR` | `./data` | Session persistence directory |
+| `WEGATE_API_PORT` | `9800` | HTTP API listen port |
+| `WEGATE_API_HOST` | `127.0.0.1` | HTTP API listen host |
+| `WEGATE_CLAUDE_CMD` | `claude` | Claude Code CLI command |
+| `WEGATE_ASSET_URL` | — | Asset management AI endpoint URL |
+| `WEGATE_PROCESSORS` | — | Additional processors as JSON array |
+
+### Adding Custom Processors
+
+```bash
+export WEGATE_PROCESSORS='[{"name":"discount","type":"http","prefix":"/discount","url":"http://localhost:8081/ai/chat"}]'
+```
+
+## HTTP API
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/send` | Push a message to WeChat |
+| `GET` | `/api/status` | Gateway status |
+
+### Push notification example
+
+```bash
+curl -X POST http://127.0.0.1:9800/api/send \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "Monthly reminder: pay rent"}'
+```
+
+## Deployment (systemd)
+
+```bash
+sudo cp wegate.service /etc/systemd/system/
+sudo mkdir -p /opt/wegate
+sudo cp -r dist/ package.json node_modules/ /opt/wegate/
+# Create /opt/wegate/.env with your config
+sudo systemctl enable --now wegate
+```
 
 ## Project Structure
 
 ```
 src/
-├── client/ilink.ts   # iLink HTTP API client (login, getUpdates, sendMessage)
-├── store/session.ts   # JSON file persistence (tokens, peers, cursor)
-└── index.ts           # CLI entry point (QR login → message loop → interactive chat)
+├── client/ilink.ts          # iLink HTTP API client
+├── store/session.ts         # JSON file persistence
+├── bridge.ts                # QR login + message long-poll loop
+├── router.ts                # Sticky prefix-based message router
+├── processors/
+│   ├── claude.ts            # Claude Code CLI subprocess processor
+│   └── http.ts              # Generic HTTP backend processor
+├── api.ts                   # HTTP API server (/api/send, /api/status)
+├── types.ts                 # Interfaces, config loader
+└── index.ts                 # Entry point — assembles all modules
+tests/
+├── router.test.ts           # Router parsing + sticky routing
+├── http-processor.test.ts   # HTTP processor with mocked fetch
+└── session.test.ts          # Session store persistence
 ```
+
+## Commands (via WeChat)
+
+| Command | Action |
+|---|---|
+| `/help` | Show available commands |
+| `/status` | Current processor and connection status |
+| `/claude` | Switch to Claude Code (resumes previous session) |
+| `/asset ...` | Forward to asset management service |
+| `/clear` | Reset current processor's session |
 
 ## Roadmap
 
-- [ ] HTTP API (`/api/send`, `/api/webhook`, `/api/status`) for external service integration
-- [ ] Message router with prefix-based routing to multiple backends
 - [ ] Media message support (images, files, voice)
 - [ ] WebUI management console
+- [ ] Python/Go SDK for `/api/send`
+- [ ] Message event logging and query API
 
 ## License
 

@@ -1,0 +1,15 @@
+[Unit]
+Description=Wegate - WeChat Message Gateway
+After=network.target
+
+[Service]
+Type=simple
+User=xyg
+WorkingDirectory=/opt/wegate
+ExecStart=/usr/bin/node dist/index.js
+EnvironmentFile=/opt/wegate/.env
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

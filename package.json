@@ -10,7 +10,9 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "keywords": [
     "wechat",
@@ -23,7 +25,8 @@
     "@types/node": "^22.0.0",
     "@types/qrcode-terminal": "^0.12.2",
     "tsx": "^4.19.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.10"
   },
   "dependencies": {
     "qrcode-terminal": "^0.12.0"
