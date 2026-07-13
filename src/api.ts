@@ -1,12 +1,20 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import type { ILinkClient } from "./client/ilink.js";
 import type { SessionStore } from "./store/session.js";
 import type { Router } from "./router.js";
+
+const log = (msg: string, ...args: unknown[]) =>
+  console.log(`[wegate] ${msg}`, ...args);
+const logError = (msg: string, ...args: unknown[]) =>
+  console.error(`[wegate] ${msg}`, ...args);
 
 export interface ApiServerDeps {
   client: ILinkClient;
   store: SessionStore;
   router: Router;
+  /** Optional shared secret required via `Authorization: Bearer <token>`. */
+  apiToken?: string;
 }
 
 export function startApiServer(
@@ -39,14 +47,46 @@ async function handleRequest(
   const path = url.pathname;
 
   if (path === "/api/status" && req.method === "GET") {
+    if (!isAuthorized(req, deps.apiToken)) {
+      logError(`/api/status 鉴权失败，拒绝请求`);
+      return jsonResponse(res, 401, { error: "unauthorized" });
+    }
     return handleStatus(res, deps);
   }
 
   if (path === "/api/send" && req.method === "POST") {
+    if (!isAuthorized(req, deps.apiToken)) {
+      logError(`/api/send 鉴权失败，拒绝请求`);
+      return jsonResponse(res, 401, { error: "unauthorized" });
+    }
     return handleSend(req, res, deps);
   }
 
   jsonResponse(res, 404, { error: "not found" });
+}
+
+/**
+ * When `apiToken` is unset (WEGATE_API_TOKEN not configured), every request
+ * is authorized — preserving the pre-existing no-auth behavior. Otherwise
+ * the request must carry a matching `Authorization: Bearer <token>` header.
+ */
+function isAuthorized(req: IncomingMessage, apiToken: string | undefined): boolean {
+  if (!apiToken) return true;
+
+  const header = req.headers.authorization;
+  if (!header) return false;
+
+  const match = /^Bearer\s+(.+)$/.exec(header);
+  if (!match) return false;
+
+  return safeEqual(match[1], apiToken);
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
 }
 
 function handleStatus(res: ServerResponse, deps: ApiServerDeps) {
@@ -84,19 +124,27 @@ async function handleSend(
   }
 
   const { client, store } = deps;
+  const summary = text.slice(0, 80) + (text.length > 80 ? "..." : "");
 
+  // Fallback when 'to' is omitted: use the most recently active peer.
+  // NOTE: store.currentPeer is NOT "most recent" — it's set once on the
+  // first-ever peer and never updated afterwards (see SessionStore.upsertPeer).
+  // listPeers() is sorted by last_seen_at descending, so [0] is the real
+  // "most recently active" peer.
   let to = data.to?.trim();
   if (!to) {
-    to = store.currentPeer;
+    to = store.listPeers()[0];
   }
   if (!to) {
+    logError(`/api/send 失败: 未提供 'to' 且没有任何联系人 — 消息摘要: "${summary}"`);
     return jsonResponse(res, 400, {
-      error: "missing 'to' field and no current peer",
+      error: "missing 'to' field and no known peer (nobody has messaged the bot yet)",
     });
   }
 
   const token = store.getPeerToken(to);
   if (!token) {
+    logError(`/api/send 失败: peer '${to}' 没有 context_token — 消息摘要: "${summary}"`);
     return jsonResponse(res, 400, {
       error: `no context_token for peer '${to}', they must message you first`,
     });
@@ -104,9 +152,11 @@ async function handleSend(
 
   try {
     await client.sendText(to, text, token);
+    log(`/api/send 成功 → [${to}]: "${summary}"`);
     jsonResponse(res, 200, { ok: true, to, text });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    logError(`/api/send 失败 → [${to}]: "${summary}" — ${msg}`);
     jsonResponse(res, 502, { error: `send failed: ${msg}` });
   }
 }

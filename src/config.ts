@@ -9,9 +9,28 @@ export function loadConfig(): WegateConfig {
     throw new Error(`无效的 WEGATE_API_PORT: ${process.env.WEGATE_API_PORT}`);
   }
 
+  const apiToken = getApiToken();
   if (apiHost !== "127.0.0.1" && apiHost !== "localhost") {
+    if (apiToken) {
+      console.warn(
+        `[wegate] 警告: API 绑定到 ${apiHost}（非本地地址），已启用 WEGATE_API_TOKEN 鉴权，` +
+          `但仍建议仅在受信任网络/HTTPS 反向代理后暴露，避免 token 被窃听`,
+      );
+    } else {
+      console.warn(
+        `[wegate] 严重警告: API 绑定到 ${apiHost}（非本地地址），且未设置 WEGATE_API_TOKEN，` +
+          `/api/send 和 /api/status 完全没有鉴权保护 —— 任何能访问该地址的人都可以冒充你收发微信消息。` +
+          `强烈建议设置 WEGATE_API_TOKEN 或将 WEGATE_API_HOST 绑定回 127.0.0.1`,
+      );
+    }
+  }
+
+  const allowedSenders = getAllowedSenders();
+  if (!allowedSenders) {
     console.warn(
-      `[wegate] 警告: API 绑定到 ${apiHost}，无认证保护，请确保网络安全`,
+      "[wegate] 警告: 未设置 WEGATE_ALLOWED_SENDERS，任何加了这个微信账号的联系人发消息" +
+        "都可以直接驱动 Claude Code 处理器（以 $HOME 为工作目录、继承完整环境变量执行）。" +
+        "强烈建议设置发送者白名单",
     );
   }
 
@@ -46,4 +65,27 @@ export function loadConfig(): WegateConfig {
   }
 
   return { dataDir, processors, apiPort, apiHost };
+}
+
+/**
+ * Optional shared-secret for /api/send and /api/status. When set, requests
+ * must include a matching `Authorization: Bearer <token>` header.
+ */
+export function getApiToken(): string | undefined {
+  const token = process.env.WEGATE_API_TOKEN?.trim();
+  return token || undefined;
+}
+
+/**
+ * Optional whitelist of WeChat contact IDs allowed to drive processors
+ * (e.g. Claude Code). Comma-separated. When unset, any contact is allowed.
+ */
+export function getAllowedSenders(): string[] | undefined {
+  const raw = process.env.WEGATE_ALLOWED_SENDERS;
+  if (!raw) return undefined;
+  const list = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return list.length > 0 ? list : undefined;
 }
