@@ -9,9 +9,9 @@ Wegate lets you **send and receive WeChat messages** programmatically through Te
 - **QR code login** — scan once, session persists across restarts
 - **Receive messages** — long-polling with automatic `context_token` capture
 - **Send messages** — proactive push to any contact who messaged you first
-- **Sticky routing** — prefix commands (`/asset`, `/claude`) switch between processors, plain text follows the last used one
+- **Sticky routing** — prefix commands (e.g. `/claude`, or any custom prefix you register) switch between processors, plain text follows the last used one
 - **Claude Code integration** — default processor spawns Claude Code CLI with session resume
-- **HTTP processors** — route messages to any HTTP backend (asset management, etc.)
+- **HTTP processors** — route messages to any HTTP backend you configure
 - **Push API** — `POST /api/send` lets external services push notifications to WeChat
 - **systemd ready** — runs as a daemon on your server
 
@@ -36,7 +36,7 @@ WeChat ←→ iLink API ←→ Bridge (long-poll) ←→ Router ←→ Processor
 ### Message Flow
 
 ```
-Inbound:  WeChat user sends "查查我的资产"
+Inbound:  WeChat user sends "帮我看看这份文档"
           → Bridge receives via getUpdates
           → Router parses prefix, resolves processor
           → Processor.send(message, chatId)
@@ -50,8 +50,8 @@ Outbound: External service POSTs to /api/send
 ### Sticky Routing
 
 ```
-/asset 查查我的资产     →  active = asset, forwards to asset processor
-那黄金呢               →  still goes to asset (sticky)
+/discount 有什么优惠     →  active = discount, forwards to discount processor
+还有别的吗              →  still goes to discount (sticky)
 /claude                →  active = claude, resumes previous session
 帮我看看这个函数        →  goes to Claude Code
 /clear                 →  resets current processor's session
@@ -67,7 +67,7 @@ All config via environment variables:
 | `WEGATE_API_PORT` | `9800` | HTTP API listen port |
 | `WEGATE_API_HOST` | `127.0.0.1` | HTTP API listen host |
 | `WEGATE_CLAUDE_CMD` | `claude` | Claude Code CLI command |
-| `WEGATE_ASSET_URL` | — | Asset management AI endpoint URL |
+| `WEGATE_ASSET_URL` | — | Enables the built-in `asset` HTTP processor, pointed at this endpoint |
 | `WEGATE_PROCESSORS` | — | Additional processors as JSON array |
 
 ### Adding Custom Processors
@@ -128,7 +128,7 @@ tests/
 | `/help` | Show available commands |
 | `/status` | Current processor and connection status |
 | `/claude` | Switch to Claude Code (resumes previous session) |
-| `/asset ...` | Forward to asset management service |
+| `/asset ...` | Forward to the configured HTTP processor |
 | `/clear` | Reset current processor's session |
 
 ## Roadmap

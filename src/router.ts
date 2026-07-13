@@ -2,14 +2,13 @@ import type { Processor, RouteResult } from "./types.js";
 
 const BUILTIN_COMMANDS = new Set(["clear", "claude", "help", "status"]);
 
-// Matches: optional leading whitespace, #word, then at least one whitespace or end of string.
-// Captures: (1) command name, (2) remaining text after the whitespace (may be empty/undefined).
+// Matches: optional leading whitespace, #word, then optionally whitespace + body.
+// Captures: (1) command name, (2) remaining text after the whitespace (may be undefined).
 // Rules:
 //   - No non-whitespace characters before #
 //   - # must be immediately followed by letters (no space)
-//   - At least one space or newline after #word to be valid
-//   - #word at end of string without trailing space is NOT a command (treated as plain text)
-const HASH_CMD_RE = /^\s*#([a-zA-Z]\w*)(?:\s+([\s\S]*)|\s+)$/;
+//   - A bare "#word" with nothing after it is still a valid command (body undefined)
+const HASH_CMD_RE = /^\s*#([a-zA-Z]\w*)(?:\s+([\s\S]*))?\s*$/;
 
 export class Router {
   private processors = new Map<string, Processor>();
@@ -48,6 +47,8 @@ export class Router {
           text: body,
         };
       }
+
+      return { type: "command", command: name, args: body || "" };
     }
 
     return { type: "message", text: text.trim() };

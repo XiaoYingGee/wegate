@@ -72,6 +72,7 @@ export async function startMessageLoop(
   onMessage: MessageHandler,
 ): Promise<never> {
   let timeoutMs = 35_000;
+  const pending = new Map<string, Promise<void>>();
 
   while (true) {
     try {
@@ -102,11 +103,11 @@ export async function startMessageLoop(
           await store.save();
 
           const text = extractText(msg);
-          try {
-            await onMessage(from, text, msg);
-          } catch (err) {
-            logError(`消息处理异常 [${from}]:`, err);
-          }
+          const prior = pending.get(from) ?? Promise.resolve();
+          const task = prior
+            .then(() => onMessage(from, text, msg))
+            .catch((err) => logError(`消息处理异常 [${from}]:`, err));
+          pending.set(from, task);
         }
       }
     } catch (err) {

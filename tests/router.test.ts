@@ -55,19 +55,19 @@ describe("Router.parse — # prefix rules", () => {
     });
   });
 
-  it("treats #word without trailing space as plain text", () => {
+  it("treats bare #word (no trailing space) as a valid processor switch", () => {
     const router = new Router();
     router.registerProcessor(mockProcessor("asset"), { prefix: "#asset" });
     expect(router.parse("#asset")).toEqual({
-      type: "message", text: "#asset",
+      type: "message", processor: "asset", text: undefined,
     });
   });
 
-  it("treats #word joined with other text as plain text", () => {
+  it("treats #word joined with digits as an unrecognized command", () => {
     const router = new Router();
     router.registerProcessor(mockProcessor("asset"), { prefix: "#asset" });
     expect(router.parse("#asset123")).toEqual({
-      type: "message", text: "#asset123",
+      type: "command", command: "asset123", args: "",
     });
   });
 
@@ -103,10 +103,10 @@ describe("Router.parse — # prefix rules", () => {
     });
   });
 
-  it("treats unknown # prefix as plain text", () => {
+  it("treats unknown # prefix as an unrecognized command", () => {
     const router = new Router();
     expect(router.parse("#unknown 查查")).toEqual({
-      type: "message", text: "#unknown 查查",
+      type: "command", command: "unknown", args: "查查",
     });
   });
 

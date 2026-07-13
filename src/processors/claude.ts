@@ -52,7 +52,8 @@ export class ClaudeCodeProcessor implements Processor {
     return new Promise((resolve, reject) => {
       const child = spawn(this.command, args, {
         stdio: ["ignore", "pipe", "pipe"],
-        timeout: 300_000,
+        timeout: 600_000,
+        cwd: process.env.HOME || undefined,
         env: { ...process.env },
       });
 
@@ -69,17 +70,20 @@ export class ClaudeCodeProcessor implements Processor {
         reject(err);
       });
 
-      child.on("close", (code) => {
+      child.on("close", (code, signal) => {
         this.activeChildren.delete(child);
         const out = Buffer.concat(stdout).toString("utf-8").trim();
         const errOut = Buffer.concat(stderr).toString("utf-8").trim();
 
         if (code !== 0) {
           if (!out) {
-            reject(new Error(errOut || `exit code ${code}`));
+            const detail = signal ? `执行超时或被终止 (${signal})` : errOut || `exit code ${code}`;
+            reject(new Error(detail));
             return;
           }
-          console.error(`[claude] 非零退出码 ${code}: ${errOut.slice(0, 200)}`);
+          console.error(
+            `[claude] 非零退出码 ${code}${signal ? ` signal=${signal}` : ""}: ${errOut.slice(0, 200)}`,
+          );
         }
 
         let sessionId: string | undefined;

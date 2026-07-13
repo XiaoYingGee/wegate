@@ -7,6 +7,7 @@ import { HttpProcessor } from "./processors/http.js";
 import { ensureLogin, startMessageLoop } from "./bridge.js";
 import { startApiServer } from "./api.js";
 import { loadConfig } from "./config.js";
+import type { Processor } from "./types.js";
 
 const log = (msg: string, ...args: unknown[]) =>
   console.log(`[wegate] ${msg}`, ...args);
@@ -79,13 +80,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    log(`→ [${processor.name}] ${msgText.slice(0, 50)}...`);
-    const resp = await processor.send(msgText, from);
-    const tag = `[${processor.name}] `;
-    await reply(client, store, from, tag + resp.text);
-    if (resp.error) {
-      logError(`[${processor.name}] 处理错误: ${resp.text}`);
-    }
+    await sendToProcessor(processor, msgText, from, client, store);
   }).catch((err) => {
     logError("消息循环异常退出:", err);
     process.exit(1);
@@ -107,17 +102,7 @@ async function handleCommand(
 ): Promise<void> {
   switch (command) {
     case "help": {
-      const lines = [
-        "Wegate 命令（#号开头，后接空格）:",
-        "  #help — 显示此帮助",
-        "  #status — 当前状态",
-        "  #claude — 切回 Claude Code",
-        "  #clear — 重置当前处理器的会话",
-        ...Array.from(new Set(router.listProcessors()))
-          .filter((n) => n !== "claude")
-          .map((n) => `  #${n} <消息> — 切换到 ${n}`),
-      ];
-      await reply(client, store, chatId, lines.join("\n"));
+      await reply(client, store, chatId, buildCommandList(router));
       break;
     }
 
@@ -134,10 +119,15 @@ async function handleCommand(
     }
 
     case "claude": {
-      if (router.switchTo(chatId, "claude")) {
-        await reply(client, store, chatId, "已切换到 Claude Code");
-      } else {
+      if (!router.switchTo(chatId, "claude")) {
         await reply(client, store, chatId, "Claude Code 处理器不可用");
+        break;
+      }
+      if (args) {
+        const processor = router.getProcessor("claude")!;
+        await sendToProcessor(processor, args, chatId, client, store);
+      } else {
+        await reply(client, store, chatId, "已切换到 Claude Code");
       }
       break;
     }
@@ -155,7 +145,42 @@ async function handleCommand(
     }
 
     default:
-      await reply(client, store, chatId, `未知命令: /${command}`);
+      await reply(
+        client,
+        store,
+        chatId,
+        `未识别的命令: #${command}\n\n${buildCommandList(router)}`,
+      );
+  }
+}
+
+function buildCommandList(router: Router): string {
+  const lines = [
+    "Wegate 命令（#号开头，后接空格）:",
+    "  #help — 显示此帮助",
+    "  #status — 当前状态",
+    "  #claude — 切回 Claude Code",
+    "  #clear — 重置当前处理器的会话",
+    ...Array.from(new Set(router.listProcessors()))
+      .filter((n) => n !== "claude")
+      .map((n) => `  #${n} <消息> — 切换到 ${n}`),
+  ];
+  return lines.join("\n");
+}
+
+async function sendToProcessor(
+  processor: Processor,
+  text: string,
+  chatId: string,
+  client: ILinkClient,
+  store: SessionStore,
+): Promise<void> {
+  log(`→ [${processor.name}] ${text.slice(0, 50)}...`);
+  const resp = await processor.send(text, chatId);
+  const tag = `[${processor.name}] `;
+  await reply(client, store, chatId, tag + resp.text);
+  if (resp.error) {
+    logError(`[${processor.name}] 处理错误: ${resp.text}`);
   }
 }
 
