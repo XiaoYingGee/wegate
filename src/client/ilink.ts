@@ -3,6 +3,9 @@ import { randomBytes } from "node:crypto";
 const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 
+const logError = (msg: string, ...args: unknown[]) =>
+  console.error(`[wegate] ${msg}`, ...args);
+
 // ── Types ──
 
 export interface QRCodeResponse {
@@ -48,6 +51,12 @@ export interface GetUpdatesResponse {
   get_updates_buf?: string;
   sync_buf?: string;
   longpolling_timeout_ms?: number;
+}
+
+export interface SendMessageResponse {
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
 }
 
 // ── Client ──
@@ -134,7 +143,20 @@ export class ILinkClient {
       },
     };
 
-    await this.postJSON("/ilink/bot/sendmessage", body);
+    const resp = await this.postJSON<SendMessageResponse>(
+      "/ilink/bot/sendmessage",
+      body,
+    );
+
+    const errcode = resp.errcode ?? resp.ret;
+    if (errcode) {
+      logError(
+        `sendmessage 被 iLink 拒绝: errcode=${errcode} errmsg=${resp.errmsg ?? ""} to=${toUserID} —— 对方可能长时间未活跃，context_token 可能已过期`,
+      );
+      throw new Error(
+        `sendmessage 业务层失败: errcode=${errcode} errmsg=${resp.errmsg ?? "unknown"}`,
+      );
+    }
   }
 
   // ── Internal ──
