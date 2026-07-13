@@ -9,7 +9,7 @@ Wegate lets you **send and receive WeChat messages** programmatically through Te
 - **QR code login** — scan once, session persists across restarts
 - **Receive messages** — long-polling with automatic `context_token` capture
 - **Send messages** — proactive push to any contact who messaged you first
-- **Sticky routing** — prefix commands (e.g. `/claude`, or any custom prefix you register) switch between processors, plain text follows the last used one
+- **Sticky routing** — prefix commands (e.g. `#claude`, or any custom prefix you register) switch between processors, plain text follows the last used one
 - **Claude Code integration** — default processor spawns Claude Code CLI with session resume
 - **HTTP processors** — route messages to any HTTP backend you configure
 - **Push API** — `POST /api/send` lets external services push notifications to WeChat
@@ -50,11 +50,11 @@ Outbound: External service POSTs to /api/send
 ### Sticky Routing
 
 ```
-/discount 有什么优惠     →  active = discount, forwards to discount processor
-还有别的吗              →  still goes to discount (sticky)
-/claude                →  active = claude, resumes previous session
-帮我看看这个函数        →  goes to Claude Code
-/clear                 →  resets current processor's session
+#notes 记一下明天开会      →  active = notes, forwards to notes processor
+还有别的要加吗            →  still goes to notes (sticky)
+#claude                  →  active = claude, resumes previous session
+帮我看看这个函数           →  goes to Claude Code
+#clear                   →  resets current processor's session
 ```
 
 ## Configuration
@@ -67,15 +67,16 @@ All config via environment variables:
 | `WEGATE_API_PORT` | `9800` | HTTP API listen port |
 | `WEGATE_API_HOST` | `127.0.0.1` | HTTP API listen host |
 | `WEGATE_CLAUDE_CMD` | `claude` | Claude Code CLI command |
-| `WEGATE_ASSET_URL` | — | Enables the built-in `asset` HTTP processor, pointed at this endpoint |
-| `WEGATE_PROCESSORS` | — | Additional processors as JSON array |
+| `WEGATE_CLAUDE_CWD` | `$HOME` | Working directory for the spawned Claude Code CLI. Claude Code auto-discovers project config (`CLAUDE.md`, `.claude/skills/`) by walking up from its cwd, so pointing this at a project directory loads that project's own skills for messages routed through the `claude` processor |
+| `WEGATE_PROCESSORS` | — | Additional processors as a JSON array — the general way to expose any HTTP backend as a `#<name>` command (see below) |
+| `WEGATE_ASSET_URL` | — | Convenience shortcut equivalent to registering a `WEGATE_PROCESSORS` entry named `asset` with prefix `#asset` — prefer `WEGATE_PROCESSORS` for anything beyond a single extra backend |
 | `WEGATE_API_TOKEN` | — | Optional shared secret; when set, `/api/send` and `/api/status` require a matching `Authorization: Bearer <token>` header |
 | `WEGATE_ALLOWED_SENDERS` | — | Optional comma-separated list of WeChat contact IDs allowed to drive processors (e.g. Claude Code). When unset, any contact who messages the bot can drive it |
 
 ### Adding Custom Processors
 
 ```bash
-export WEGATE_PROCESSORS='[{"name":"discount","type":"http","prefix":"/discount","url":"http://localhost:8081/ai/chat"}]'
+export WEGATE_PROCESSORS='[{"name":"notes","type":"http","prefix":"#notes","url":"http://localhost:8081/ai/chat"}]'
 ```
 
 ## HTTP API
@@ -126,11 +127,14 @@ src/
 │   ├── claude.ts            # Claude Code CLI subprocess processor
 │   └── http.ts              # Generic HTTP backend processor
 ├── api.ts                   # HTTP API server (/api/send, /api/status)
-├── types.ts                 # Interfaces, config loader
+├── types.ts                 # Shared interfaces/types
+├── config.ts                # Env-var driven config loader
 └── index.ts                 # Entry point — assembles all modules
 tests/
 ├── router.test.ts           # Router parsing + sticky routing
 ├── http-processor.test.ts   # HTTP processor with mocked fetch
+├── claude-processor.test.ts # Claude Code CLI subprocess processor
+├── config.test.ts           # Config loader
 └── session.test.ts          # Session store persistence
 ```
 
@@ -138,11 +142,11 @@ tests/
 
 | Command | Action |
 |---|---|
-| `/help` | Show available commands |
-| `/status` | Current processor and connection status |
-| `/claude` | Switch to Claude Code (resumes previous session) |
-| `/asset ...` | Forward to the configured HTTP processor |
-| `/clear` | Reset current processor's session |
+| `#help` | Show available commands |
+| `#status` | Current processor and connection status |
+| `#claude` | Switch to Claude Code (resumes previous session) |
+| `#<processor> <message>` | Forward to a registered processor (e.g. `#asset`, or any custom processor added via `WEGATE_PROCESSORS`) |
+| `#clear` | Reset current processor's session |
 
 ## Roadmap
 

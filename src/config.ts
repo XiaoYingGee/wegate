@@ -1,3 +1,4 @@
+import { existsSync, statSync } from "node:fs";
 import type { ProcessorConfig, WegateConfig } from "./types.js";
 
 export function loadConfig(): WegateConfig {
@@ -25,11 +26,12 @@ export function loadConfig(): WegateConfig {
     }
   }
 
+  const claudeCwd = getClaudeCwd();
   const allowedSenders = getAllowedSenders();
   if (!allowedSenders) {
     console.warn(
       "[wegate] 警告: 未设置 WEGATE_ALLOWED_SENDERS，任何加了这个微信账号的联系人发消息" +
-        "都可以直接驱动 Claude Code 处理器（以 $HOME 为工作目录、继承完整环境变量执行）。" +
+        `都可以直接驱动 Claude Code 处理器（以 ${claudeCwd || "$HOME"} 为工作目录、继承完整环境变量执行）。` +
         "强烈建议设置发送者白名单",
     );
   }
@@ -41,6 +43,7 @@ export function loadConfig(): WegateConfig {
       name: "claude",
       type: "claude",
       command: process.env.WEGATE_CLAUDE_CMD || "claude",
+      cwd: claudeCwd,
       default: true,
     });
   }
@@ -74,6 +77,28 @@ export function loadConfig(): WegateConfig {
 export function getApiToken(): string | undefined {
   const token = process.env.WEGATE_API_TOKEN?.trim();
   return token || undefined;
+}
+
+/**
+ * Optional working directory for the spawned Claude Code CLI subprocess.
+ * Claude Code discovers project-level config (CLAUDE.md, .claude/skills/)
+ * by walking up from its cwd, so pointing this at a specific project
+ * directory lets that project's own skills load for messages routed here.
+ * Falls back to $HOME (Claude Code's own default project scope) when unset
+ * or when the configured path doesn't exist / isn't a directory.
+ */
+export function getClaudeCwd(): string | undefined {
+  const raw = process.env.WEGATE_CLAUDE_CWD?.trim();
+  if (!raw) return process.env.HOME || undefined;
+
+  if (!existsSync(raw) || !statSync(raw).isDirectory()) {
+    console.warn(
+      `[wegate] 警告: WEGATE_CLAUDE_CWD="${raw}" 不存在或不是目录，已回退为 $HOME`,
+    );
+    return process.env.HOME || undefined;
+  }
+
+  return raw;
 }
 
 /**

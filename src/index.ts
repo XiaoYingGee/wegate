@@ -28,7 +28,7 @@ async function main(): Promise<void> {
   // 2. Register processors
   for (const pc of config.processors) {
     if (pc.type === "claude") {
-      router.registerProcessor(new ClaudeCodeProcessor(pc.command, pc.name), {
+      router.registerProcessor(new ClaudeCodeProcessor(pc.command, pc.name, pc.cwd), {
         prefix: pc.prefix,
         isDefault: pc.default,
       });

@@ -43,12 +43,14 @@ const SIGKILL_GRACE_MS = 4_000;
 export class ClaudeCodeProcessor implements Processor {
   readonly name: string;
   private command: string;
+  private cwd?: string;
   private sessions = new Map<string, string>();
   private activeChildren = new Set<ChildProcess>();
 
-  constructor(command = "claude", name = "claude") {
+  constructor(command = "claude", name = "claude", cwd?: string) {
     this.command = command;
     this.name = name;
+    this.cwd = cwd;
   }
 
   async send(message: string, chatId: string): Promise<ProcessorResponse> {
@@ -136,7 +138,7 @@ export class ClaudeCodeProcessor implements Processor {
       const child = spawn(this.command, args, {
         stdio: ["ignore", "pipe", "pipe"],
         timeout: 600_000,
-        cwd: process.env.HOME || undefined,
+        cwd: this.cwd || process.env.HOME || undefined,
         env: { ...process.env },
       });
 

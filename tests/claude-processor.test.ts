@@ -100,6 +100,36 @@ describe("ClaudeCodeProcessor — BUG-8 session_id 提取", () => {
     const result = await pending;
     expect(result.text).toBe("纯文本回复，不是 JSON");
   });
+
+  it("传入 cwd 时，子进程以该目录作为工作目录启动（而不是硬编码 $HOME）", async () => {
+    const child = new FakeChildProcess();
+    mockSpawn(child);
+
+    const processor = new ClaudeCodeProcessor("claude", "claude", "/some/project/dir");
+    const pending = processor.send("hello", "chat-cwd");
+    child.stdout.emit("data", Buffer.from(JSON.stringify({ result: "ok" })));
+    child.emit("close", 0, null);
+    await pending;
+
+    const calls = (spawn as unknown as ReturnType<typeof vi.fn>).mock.calls;
+    const opts = calls[calls.length - 1][2] as { cwd?: string };
+    expect(opts.cwd).toBe("/some/project/dir");
+  });
+
+  it("未传入 cwd 时，回退为 $HOME（保持向后兼容）", async () => {
+    const child = new FakeChildProcess();
+    mockSpawn(child);
+
+    const processor = new ClaudeCodeProcessor("claude", "claude");
+    const pending = processor.send("hello", "chat-cwd-default");
+    child.stdout.emit("data", Buffer.from(JSON.stringify({ result: "ok" })));
+    child.emit("close", 0, null);
+    await pending;
+
+    const calls = (spawn as unknown as ReturnType<typeof vi.fn>).mock.calls;
+    const opts = calls[calls.length - 1][2] as { cwd?: string };
+    expect(opts.cwd).toBe(process.env.HOME || undefined);
+  });
 });
 
 describe("ClaudeCodeProcessor — BUG-10 信号中断不能被当作完整成功返回", () => {
