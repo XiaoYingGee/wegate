@@ -77,4 +77,24 @@ describe("ILinkClient.sendText", () => {
 
     vi.restoreAllMocks();
   });
+
+  it("replaces \\n/\\r\\n/\\r with U+2028 (WeChat client renders \\n as no line break at all)", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({ errcode: 0 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    const client = new ILinkClient("https://example.com", "tok");
+    await client.sendText("peer1", "line1\nline2\r\nline3\rline4", "ctx");
+
+    const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.msg.item_list[0].text_item.text).toBe(
+      "line1 line2 line3 line4",
+    );
+
+    vi.restoreAllMocks();
+  });
 });

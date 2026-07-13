@@ -131,6 +131,9 @@ export class ILinkClient {
     text: string,
     contextToken: string,
   ): Promise<void> {
+    // 微信客户端不识别 \n/\r\n 作为换行（实测挤成一行），
+    // U+2028 (LINE SEPARATOR) 是实测唯一能在手机/电脑微信都正确换行的编码。
+    const wechatText = text.replace(/\r\n|\r|\n/g, " ");
     const body = {
       msg: {
         from_user_id: "",
@@ -139,7 +142,7 @@ export class ILinkClient {
         message_type: 2,
         message_state: 2,
         context_token: contextToken,
-        item_list: [{ type: 1, text_item: { text } }],
+        item_list: [{ type: 1, text_item: { text: wechatText } }],
       },
     };
 
