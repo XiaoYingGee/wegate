@@ -6,7 +6,7 @@ import { ClaudeCodeProcessor } from "./processors/claude.js";
 import { HttpProcessor } from "./processors/http.js";
 import { ensureLogin, startMessageLoop } from "./bridge.js";
 import { startApiServer } from "./api.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, getApiToken, getAllowedSenders } from "./config.js";
 import type { Processor } from "./types.js";
 
 const log = (msg: string, ...args: unknown[]) =>
@@ -42,8 +42,14 @@ async function main(): Promise<void> {
 
   log(`已注册 ${router.listProcessors().length} 个处理器: ${router.listProcessors().join(", ")}`);
 
+  const allowedSenders = getAllowedSenders();
+
   // 3. Start API server
-  const server = startApiServer({ client, store, router }, config.apiHost, config.apiPort);
+  const server = startApiServer(
+    { client, store, router, apiToken: getApiToken() },
+    config.apiHost,
+    config.apiPort,
+  );
 
   // 4. Graceful shutdown
   const shutdown = async () => {
@@ -59,6 +65,15 @@ async function main(): Promise<void> {
   // 5. Start message loop
   startMessageLoop(client, store, async (from, text) => {
     log(`← [${from}] ${text}`);
+
+    // Sender whitelist gate: must run before ANY routing (including #commands,
+    // which can reach processors directly, e.g. "#claude <msg>"). Reject early
+    // so an unauthorized contact can never reach a processor.
+    if (!isSenderAllowed(from, allowedSenders)) {
+      logError(`拒绝未授权发送者的消息: ${from}`);
+      await reply(client, store, from, "抱歉，你没有权限使用此机器人，该消息未被处理。");
+      return;
+    }
 
     const parsed = router.parse(text);
 
@@ -184,6 +199,15 @@ async function sendToProcessor(
   }
 }
 
+/**
+ * Whether `from` is allowed to drive processors. When `allowedSenders` is
+ * unset/empty, every sender is allowed (matches pre-existing behavior).
+ */
+export function isSenderAllowed(from: string, allowedSenders: string[] | undefined): boolean {
+  if (!allowedSenders || allowedSenders.length === 0) return true;
+  return allowedSenders.includes(from);
+}
+
 async function reply(
   client: ILinkClient,
   store: SessionStore,
@@ -196,25 +220,53 @@ async function reply(
     return;
   }
 
-  try {
-    const maxLen = 2000;
-    if (text.length <= maxLen) {
+  const maxLen = 2000;
+
+  if (text.length <= maxLen) {
+    try {
       await client.sendText(to, text, token);
       log(`→ [${to}] ${text.slice(0, 80)}${text.length > 80 ? "..." : ""}`);
+    } catch (err) {
+      logError(`回复发送失败 [${to}]:`, err);
+    }
+    return;
+  }
+
+  const totalChunks = Math.ceil(text.length / maxLen);
+  let chunkIndex = 0;
+
+  for (let i = 0; i < text.length; i += maxLen) {
+    chunkIndex += 1;
+    const chunk = text.slice(i, i + maxLen);
+
+    try {
+      await client.sendText(to, chunk, token);
+    } catch (err) {
+      logError(
+        `分段回复发送失败 [${to}]: 第 ${chunkIndex}/${totalChunks} 段失败，原文本总长度 ${text.length}`,
+        err,
+      );
+
+      try {
+        await client.sendText(to, "（后续内容发送失败，请稍后重试）", token);
+      } catch (noticeErr) {
+        logError(`分段失败提示也发送失败 [${to}]，用户可能只收到不完整的回复:`, noticeErr);
+      }
       return;
     }
-
-    for (let i = 0; i < text.length; i += maxLen) {
-      const chunk = text.slice(i, i + maxLen);
-      await client.sendText(to, chunk, token);
-    }
-    log(`→ [${to}] (${Math.ceil(text.length / maxLen)} 条分段消息)`);
-  } catch (err) {
-    logError(`回复发送失败 [${to}]:`, err);
   }
+
+  log(`→ [${to}] (${totalChunks} 条分段消息)`);
 }
 
-main().catch((err) => {
-  logError("启动失败:", err);
-  process.exit(1);
-});
+// Guard against auto-running main() when this module is imported (e.g. by
+// unit tests importing isSenderAllowed) instead of executed directly.
+const isMainModule =
+  !!process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
+
+if (isMainModule) {
+  main().catch((err) => {
+    logError("启动失败:", err);
+    process.exit(1);
+  });
+}

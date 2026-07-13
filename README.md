@@ -69,6 +69,8 @@ All config via environment variables:
 | `WEGATE_CLAUDE_CMD` | `claude` | Claude Code CLI command |
 | `WEGATE_ASSET_URL` | — | Enables the built-in `asset` HTTP processor, pointed at this endpoint |
 | `WEGATE_PROCESSORS` | — | Additional processors as JSON array |
+| `WEGATE_API_TOKEN` | — | Optional shared secret; when set, `/api/send` and `/api/status` require a matching `Authorization: Bearer <token>` header |
+| `WEGATE_ALLOWED_SENDERS` | — | Optional comma-separated list of WeChat contact IDs allowed to drive processors (e.g. Claude Code). When unset, any contact who messages the bot can drive it |
 
 ### Adding Custom Processors
 
@@ -90,6 +92,17 @@ curl -X POST http://127.0.0.1:9800/api/send \
   -H 'Content-Type: application/json' \
   -d '{"text": "Monthly reminder: pay rent"}'
 ```
+
+If `WEGATE_API_TOKEN` is set, include it as a bearer token:
+
+```bash
+curl -X POST http://127.0.0.1:9800/api/send \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $WEGATE_API_TOKEN" \
+  -d '{"text": "Monthly reminder: pay rent"}'
+```
+
+Without `WEGATE_API_TOKEN`, both endpoints are unauthenticated — fine when bound to `127.0.0.1`, but dangerous if `WEGATE_API_HOST` is exposed beyond localhost.
 
 ## Deployment (systemd)
 
