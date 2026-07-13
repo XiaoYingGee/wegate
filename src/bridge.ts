@@ -66,6 +66,33 @@ export async function ensureLogin(
 
 export type MessageHandler = (from: string, text: string, msg: WeixinMessage) => Promise<void> | void;
 
+/**
+ * 将 key 相同的任务串行排队执行（保证同一联系人的消息按到达顺序处理），
+ * 并在任务完成（无论成功或失败）后从 pending 中清理自身条目，避免
+ * pending Map 随联系人数量无限增长（内存泄漏）。
+ *
+ * 清理时会校验 `pending.get(key) === task` 仍然成立，防止在本任务完成前
+ * 又有新任务入队时，被误删新任务的条目。
+ */
+export function enqueueSerial(
+  pending: Map<string, Promise<void>>,
+  key: string,
+  work: () => Promise<void> | void,
+  onError: (err: unknown) => void,
+): Promise<void> {
+  const prior = pending.get(key) ?? Promise.resolve();
+  const task: Promise<void> = prior
+    .then(() => work())
+    .catch((err) => {
+      onError(err);
+    });
+  pending.set(key, task);
+  task.finally(() => {
+    if (pending.get(key) === task) pending.delete(key);
+  });
+  return task;
+}
+
 export async function startMessageLoop(
   client: ILinkClient,
   store: SessionStore,
@@ -99,15 +126,20 @@ export async function startMessageLoop(
           const from = msg.from_user_id?.trim();
           if (!from) continue;
 
-          store.upsertPeer(from, msg.context_token?.trim());
-          await store.save();
+          try {
+            store.upsertPeer(from, msg.context_token?.trim());
+            await store.save();
 
-          const text = extractText(msg);
-          const prior = pending.get(from) ?? Promise.resolve();
-          const task = prior
-            .then(() => onMessage(from, text, msg))
-            .catch((err) => logError(`消息处理异常 [${from}]:`, err));
-          pending.set(from, task);
+            const text = extractText(msg);
+            enqueueSerial(
+              pending,
+              from,
+              () => onMessage(from, text, msg),
+              (err) => logError(`消息处理异常 [${from}]:`, err),
+            );
+          } catch (err) {
+            logError(`消息持久化/入队异常 [${from}]，跳过该条继续处理后续消息:`, err);
+          }
         }
       }
     } catch (err) {
