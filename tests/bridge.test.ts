@@ -166,3 +166,45 @@ describe("startMessageLoop — per-message error isolation (BUG-7)", () => {
     expect(received).toEqual(["peer1", "peer3"]);
   });
 });
+
+describe("startMessageLoop — cursor advances only after the batch is enqueued", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("persists the new get_updates_buf after, not before, all messages in the batch are enqueued", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const msgs = [makeMsg("peer1", "hi1"), makeMsg("peer2", "hi2")];
+
+    const getUpdates = vi
+      .fn()
+      .mockResolvedValueOnce({ errcode: 0, msgs, get_updates_buf: "buf2" })
+      .mockRejectedValue(new Error("stop-loop-for-test"));
+
+    const client = { getUpdates } as unknown as ILinkClient;
+
+    const order: string[] = [];
+    const store = {
+      session: { get_updates_buf: "buf1" },
+      upsertPeer: vi.fn((from: string) => order.push(`upsertPeer:${from}`)),
+      save: vi.fn(async () => {
+        order.push("save");
+      }),
+      setUpdatesBuf: vi.fn(() => order.push("setUpdatesBuf")),
+    } as unknown as SessionStore;
+
+    const onMessage = vi.fn(async () => {});
+
+    void startMessageLoop(client, store, onMessage);
+    await new Promise((r) => setTimeout(r, 50));
+
+    // both messages must be persisted/enqueued (upsertPeer for peer1 and peer2)
+    // strictly before the cursor (setUpdatesBuf) is advanced past this batch.
+    const cursorIndex = order.indexOf("setUpdatesBuf");
+    expect(cursorIndex).toBeGreaterThan(-1);
+    expect(order.indexOf("upsertPeer:peer1")).toBeLessThan(cursorIndex);
+    expect(order.indexOf("upsertPeer:peer2")).toBeLessThan(cursorIndex);
+  });
+});

@@ -115,12 +115,6 @@ export async function startMessageLoop(
         timeoutMs = resp.longpolling_timeout_ms;
       }
 
-      const newBuf = resp.get_updates_buf || resp.sync_buf;
-      if (newBuf && newBuf !== store.session.get_updates_buf) {
-        store.setUpdatesBuf(newBuf);
-        await store.save();
-      }
-
       if (resp.msgs) {
         for (const msg of resp.msgs) {
           const from = msg.from_user_id?.trim();
@@ -141,6 +135,15 @@ export async function startMessageLoop(
             logError(`消息持久化/入队异常 [${from}]，跳过该条继续处理后续消息:`, err);
           }
         }
+      }
+
+      // 游标必须在本批消息全部入队之后才推进：若在此之前崩溃，下次重启会
+      // 用旧游标重新拉取整批消息（可能重复处理），而不是让游标先行、
+      // 一旦崩溃就永久丢失尚未入队的消息（at-most-once → at-least-once）。
+      const newBuf = resp.get_updates_buf || resp.sync_buf;
+      if (newBuf && newBuf !== store.session.get_updates_buf) {
+        store.setUpdatesBuf(newBuf);
+        await store.save();
       }
     } catch (err) {
       logError("长轮询异常:", err);
