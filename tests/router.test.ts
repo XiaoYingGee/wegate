@@ -31,6 +31,13 @@ describe("Router.parse — # prefix rules", () => {
     });
   });
 
+  it("parses #codex as a builtin command for immediate execution", () => {
+    const router = new Router();
+    expect(router.parse("#codex inspect this")).toEqual({
+      type: "command", command: "codex", args: "inspect this",
+    });
+  });
+
   it("parses processor prefix with message", () => {
     const router = new Router();
     router.registerProcessor(mockProcessor("asset"), { prefix: "#asset" });

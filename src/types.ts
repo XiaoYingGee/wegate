@@ -18,6 +18,7 @@ export interface Processor {
 
 export type ProcessorConfig =
   | { type: "claude"; name: string; command?: string; cwd?: string; prefix?: string; default?: boolean }
+  | { type: "codex"; name: string; command?: string; cwd?: string; prefix?: string; default?: boolean }
   | { type: "http"; name: string; url: string; prefix?: string; default?: boolean };
 
 export interface RouteResult {

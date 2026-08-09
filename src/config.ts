@@ -31,7 +31,7 @@ export function loadConfig(): WegateConfig {
   if (!allowedSenders) {
     console.warn(
       "[wegate] 警告: 未设置 WEGATE_ALLOWED_SENDERS，任何加了这个微信账号的联系人发消息" +
-        `都可以直接驱动 Claude Code 处理器（以 ${claudeCwd || "$HOME"} 为工作目录、继承完整环境变量执行）。` +
+        `都可以直接驱动本机 CLI 处理器（以 ${claudeCwd || "$HOME"} 为默认工作目录、继承完整环境变量执行）。` +
         "强烈建议设置发送者白名单",
     );
   }
@@ -45,6 +45,17 @@ export function loadConfig(): WegateConfig {
       command: process.env.WEGATE_CLAUDE_CMD || "claude",
       cwd: claudeCwd,
       default: true,
+    });
+  }
+
+  if (process.env.WEGATE_ENABLE_CODEX !== "false") {
+    const codexCwd = getCodexCwd();
+    processors.push({
+      name: "codex",
+      type: "codex",
+      command: process.env.WEGATE_CODEX_CMD || "/usr/bin/codex",
+      cwd: codexCwd,
+      prefix: "#codex",
     });
   }
 
@@ -98,6 +109,20 @@ export function getClaudeCwd(): string | undefined {
     return process.env.HOME || undefined;
   }
 
+  return raw;
+}
+
+/** Working directory for Codex, with the same safe fallback as Claude Code. */
+export function getCodexCwd(): string | undefined {
+  const raw = process.env.WEGATE_CODEX_CWD?.trim();
+  if (!raw) return process.env.HOME || undefined;
+
+  if (!existsSync(raw) || !statSync(raw).isDirectory()) {
+    console.warn(
+      `[wegate] 警告: WEGATE_CODEX_CWD="${raw}" 不存在或不是目录，已回退为 $HOME`,
+    );
+    return process.env.HOME || undefined;
+  }
   return raw;
 }
 

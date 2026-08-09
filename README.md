@@ -11,6 +11,7 @@ Wegate lets you **send and receive WeChat messages** programmatically through Te
 - **Send messages** — proactive push to any contact who messaged you first
 - **Sticky routing** — prefix commands (e.g. `#claude`, or any custom prefix you register) switch between processors, plain text follows the last used one
 - **Claude Code integration** — default processor spawns Claude Code CLI with session resume
+- **Codex integration** — `#codex` runs the local Codex CLI with per-chat session resume
 - **HTTP processors** — route messages to any HTTP backend you configure
 - **Push API** — `POST /api/send` lets external services push notifications to WeChat
 - **systemd ready** — runs as a daemon on your server
@@ -54,6 +55,8 @@ Outbound: External service POSTs to /api/send
 还有别的要加吗            →  still goes to notes (sticky)
 #claude                  →  active = claude, resumes previous session
 帮我看看这个函数           →  goes to Claude Code
+#codex 检查当前项目         →  active = codex, runs immediately and keeps the session
+继续修复                   →  resumes the same Codex session
 #clear                   →  resets current processor's session
 ```
 
@@ -68,6 +71,9 @@ All config via environment variables:
 | `WEGATE_API_HOST` | `127.0.0.1` | HTTP API listen host |
 | `WEGATE_CLAUDE_CMD` | `claude` | Claude Code CLI command |
 | `WEGATE_CLAUDE_CWD` | `$HOME` | Working directory for the spawned Claude Code CLI. Claude Code auto-discovers project config (`CLAUDE.md`, `.claude/skills/`) by walking up from its cwd, so pointing this at a project directory loads that project's own skills for messages routed through the `claude` processor |
+| `WEGATE_ENABLE_CODEX` | `true` | Set to `false` to disable the built-in `#codex` processor |
+| `WEGATE_CODEX_CMD` | `/usr/bin/codex` | Local Codex CLI executable |
+| `WEGATE_CODEX_CWD` | `$HOME` | Working directory and writable workspace for Codex. New sessions use the `workspace-write` sandbox; no dangerous bypass option is enabled |
 | `WEGATE_PROCESSORS` | — | Additional processors as a JSON array — the general way to expose any HTTP backend as a `#<name>` command (see below) |
 | `WEGATE_ASSET_URL` | — | Convenience shortcut equivalent to registering a `WEGATE_PROCESSORS` entry named `asset` with prefix `#asset` — prefer `WEGATE_PROCESSORS` for anything beyond a single extra backend |
 | `WEGATE_API_TOKEN` | — | Optional shared secret; when set, `/api/send` and `/api/status` require a matching `Authorization: Bearer <token>` header |
@@ -125,6 +131,7 @@ src/
 ├── router.ts                # Sticky prefix-based message router
 ├── processors/
 │   ├── claude.ts            # Claude Code CLI subprocess processor
+│   ├── codex.ts             # Codex CLI JSONL subprocess processor
 │   └── http.ts              # Generic HTTP backend processor
 ├── api.ts                   # HTTP API server (/api/send, /api/status)
 ├── types.ts                 # Shared interfaces/types
@@ -134,6 +141,7 @@ tests/
 ├── router.test.ts           # Router parsing + sticky routing
 ├── http-processor.test.ts   # HTTP processor with mocked fetch
 ├── claude-processor.test.ts # Claude Code CLI subprocess processor
+├── codex-processor.test.ts  # Codex CLI invocation, resume, and cleanup
 ├── config.test.ts           # Config loader
 └── session.test.ts          # Session store persistence
 ```
@@ -145,6 +153,8 @@ tests/
 | `#help` | Show available commands |
 | `#status` | Current processor and connection status |
 | `#claude` | Switch to Claude Code (resumes previous session) |
+| `#codex` | Switch to local Codex (resumes the chat's previous session) |
+| `#codex <message>` | Switch to Codex and execute the message immediately |
 | `#<processor> <message>` | Forward to a registered processor (e.g. `#asset`, or any custom processor added via `WEGATE_PROCESSORS`) |
 | `#clear` | Reset current processor's session |
 

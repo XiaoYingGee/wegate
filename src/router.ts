@@ -1,6 +1,6 @@
 import type { Processor, RouteResult } from "./types.js";
 
-const BUILTIN_COMMANDS = new Set(["clear", "claude", "help", "status"]);
+const BUILTIN_COMMANDS = new Set(["clear", "claude", "codex", "help", "status"]);
 
 // Matches: optional leading whitespace, #word, then optionally whitespace + body.
 // Captures: (1) command name, (2) remaining text after the whitespace (may be undefined).

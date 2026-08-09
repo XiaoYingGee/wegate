@@ -3,6 +3,7 @@ import { ILinkClient } from "./client/ilink.js";
 import { SessionStore } from "./store/session.js";
 import { Router } from "./router.js";
 import { ClaudeCodeProcessor } from "./processors/claude.js";
+import { CodexProcessor } from "./processors/codex.js";
 import { HttpProcessor } from "./processors/http.js";
 import { ensureLogin, startMessageLoop } from "./bridge.js";
 import { startApiServer } from "./api.js";
@@ -29,6 +30,11 @@ async function main(): Promise<void> {
   for (const pc of config.processors) {
     if (pc.type === "claude") {
       router.registerProcessor(new ClaudeCodeProcessor(pc.command, pc.name, pc.cwd), {
+        prefix: pc.prefix,
+        isDefault: pc.default,
+      });
+    } else if (pc.type === "codex") {
+      router.registerProcessor(new CodexProcessor(pc.command, pc.name, pc.cwd), {
         prefix: pc.prefix,
         isDefault: pc.default,
       });
@@ -147,6 +153,20 @@ async function handleCommand(
       break;
     }
 
+    case "codex": {
+      if (!router.switchTo(chatId, "codex")) {
+        await reply(client, store, chatId, "Codex 处理器不可用");
+        break;
+      }
+      if (args) {
+        const processor = router.getProcessor("codex")!;
+        await sendToProcessor(processor, args, chatId, client, store);
+      } else {
+        await reply(client, store, chatId, "已切换到 Codex");
+      }
+      break;
+    }
+
     case "clear": {
       const active = router.getActive(chatId);
       const processor = router.getProcessor(active);
@@ -169,15 +189,17 @@ async function handleCommand(
   }
 }
 
-function buildCommandList(router: Router): string {
+export function buildCommandList(router: Router): string {
+  const processors = new Set(router.listProcessors());
   const lines = [
     "Wegate 命令（#号开头，后接空格）:",
     "  #help — 显示此帮助",
     "  #status — 当前状态",
-    "  #claude — 切回 Claude Code",
+    ...(processors.has("claude") ? ["  #claude — 切回 Claude Code"] : []),
+    ...(processors.has("codex") ? ["  #codex — 切换到 Codex"] : []),
     "  #clear — 重置当前处理器的会话",
-    ...Array.from(new Set(router.listProcessors()))
-      .filter((n) => n !== "claude")
+    ...Array.from(processors)
+      .filter((n) => n !== "claude" && n !== "codex")
       .map((n) => `  #${n} <消息> — 切换到 ${n}`),
   ];
   return lines.join("\n");
