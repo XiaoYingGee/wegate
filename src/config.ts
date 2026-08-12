@@ -37,18 +37,21 @@ export function loadConfig(): WegateConfig {
   }
 
   const processors: ProcessorConfig[] = [];
+  const claudeEnabled = process.env.WEGATE_ENABLE_CLAUDE !== "false";
+  const codexEnabled = process.env.WEGATE_ENABLE_CODEX !== "false";
 
-  if (process.env.WEGATE_ENABLE_CLAUDE !== "false") {
+  if (claudeEnabled) {
     processors.push({
       name: "claude",
       type: "claude",
       command: process.env.WEGATE_CLAUDE_CMD || "claude",
       cwd: claudeCwd,
-      default: true,
+      prefix: "#claude",
+      default: !codexEnabled,
     });
   }
 
-  if (process.env.WEGATE_ENABLE_CODEX !== "false") {
+  if (codexEnabled) {
     const codexCwd = getCodexCwd();
     processors.push({
       name: "codex",
@@ -56,6 +59,7 @@ export function loadConfig(): WegateConfig {
       command: process.env.WEGATE_CODEX_CMD || "/usr/bin/codex",
       cwd: codexCwd,
       prefix: "#codex",
+      default: true,
     });
   }
 
@@ -77,6 +81,21 @@ export function loadConfig(): WegateConfig {
       console.error("[wegate] WEGATE_PROCESSORS JSON 解析失败，已忽略");
     }
   }
+
+  if (processors.length === 0) {
+    throw new Error("没有可用的处理器，请至少启用一个 processor");
+  }
+  const preferredDefaultIndex = codexEnabled
+    ? processors.findIndex((processor) => processor.name === "codex")
+    : claudeEnabled
+      ? processors.findIndex((processor) => processor.name === "claude")
+      : Math.max(
+          processors.findIndex((processor) => processor.default),
+          0,
+        );
+  processors.forEach((processor, index) => {
+    processor.default = index === preferredDefaultIndex;
+  });
 
   return { dataDir, processors, apiPort, apiHost };
 }

@@ -6,6 +6,8 @@ import {
   getCodexCwd,
   loadConfig,
 } from "../src/config.js";
+import { Router } from "../src/router.js";
+import type { Processor } from "../src/types.js";
 
 const ENV_KEYS = [
   "WEGATE_API_TOKEN",
@@ -15,6 +17,8 @@ const ENV_KEYS = [
   "WEGATE_ENABLE_CLAUDE",
   "WEGATE_ENABLE_CODEX",
   "WEGATE_CODEX_CMD",
+  "WEGATE_ASSET_URL",
+  "WEGATE_PROCESSORS",
   "HOME",
 ] as const;
 const savedEnv: Record<string, string | undefined> = {};
@@ -93,7 +97,9 @@ describe("getClaudeCwd", () => {
     process.env.HOME = "/home/testuser";
 
     expect(getClaudeCwd()).toBe("/home/testuser");
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("不存在或不是目录"));
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("不存在或不是目录"),
+    );
   });
 });
 
@@ -115,14 +121,15 @@ describe("getCodexCwd", () => {
     process.env.WEGATE_CODEX_CWD = "/definitely/does/not/exist/codex";
     process.env.HOME = "/home/testuser";
     expect(getCodexCwd()).toBe("/home/testuser");
-    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("WEGATE_CODEX_CWD"));
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("WEGATE_CODEX_CWD"),
+    );
   });
 });
 
 describe("loadConfig Codex processor", () => {
-  it("registers #codex with the configured local command and cwd by default", () => {
+  it("uses Codex as default and keeps #claude available", () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
-    process.env.WEGATE_ENABLE_CLAUDE = "false";
     process.env.WEGATE_CODEX_CMD = "/usr/bin/codex";
     process.env.WEGATE_CODEX_CWD = process.cwd();
 
@@ -132,15 +139,83 @@ describe("loadConfig Codex processor", () => {
       command: "/usr/bin/codex",
       cwd: process.cwd(),
       prefix: "#codex",
+      default: true,
+    });
+    expect(loadConfig().processors).toContainEqual({
+      name: "claude",
+      type: "claude",
+      command: "claude",
+      cwd: undefined,
+      prefix: "#claude",
+      default: false,
     });
   });
 
-  it("can disable the Codex processor", () => {
+  it("keeps Codex as the resolved default when an extra processor requests default", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    process.env.WEGATE_PROCESSORS = JSON.stringify([
+      { name: "custom", type: "http", url: "http://localhost", default: true },
+    ]);
+
+    const config = loadConfig();
+    expect(config.processors.filter((processor) => processor.default)).toEqual([
+      expect.objectContaining({ name: "codex" }),
+    ]);
+
+    const router = new Router();
+    for (const processorConfig of config.processors) {
+      const processor: Processor = {
+        name: processorConfig.name,
+        send: async () => ({ text: "ok" }),
+        clearSession: async () => {},
+      };
+      router.registerProcessor(processor, {
+        isDefault: processorConfig.default,
+      });
+    }
+    expect(
+      router.resolve("chat", { type: "message", text: "hello" })?.name,
+    ).toBe("codex");
+  });
+
+  it("falls back to Claude as default when Codex is disabled", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    process.env.WEGATE_ENABLE_CODEX = "false";
+    expect(loadConfig().processors).toEqual([
+      expect.objectContaining({
+        type: "claude",
+        default: true,
+        prefix: "#claude",
+      }),
+    ]);
+  });
+
+  it("uses Codex as default when Claude is disabled", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    process.env.WEGATE_ENABLE_CLAUDE = "false";
+    expect(loadConfig().processors).toEqual([
+      expect.objectContaining({ type: "codex", default: true }),
+    ]);
+  });
+
+  it("makes an extra processor the default when both built-ins are disabled", () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     process.env.WEGATE_ENABLE_CLAUDE = "false";
     process.env.WEGATE_ENABLE_CODEX = "false";
-    expect(loadConfig().processors).not.toContainEqual(
-      expect.objectContaining({ type: "codex" }),
+    process.env.WEGATE_PROCESSORS = JSON.stringify([
+      { name: "custom", type: "http", url: "http://localhost" },
+    ]);
+    expect(loadConfig().processors).toEqual([
+      expect.objectContaining({ name: "custom", default: true }),
+    ]);
+  });
+
+  it("fails clearly when both built-in processors are disabled", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    process.env.WEGATE_ENABLE_CLAUDE = "false";
+    process.env.WEGATE_ENABLE_CODEX = "false";
+    expect(() => loadConfig()).toThrow(
+      "没有可用的处理器，请至少启用一个 processor",
     );
   });
 });
