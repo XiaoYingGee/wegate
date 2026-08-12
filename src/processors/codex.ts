@@ -30,7 +30,10 @@ function parseCodexJsonLines(raw: string): ParsedCodexOutput {
     if (!line.trim()) continue;
     try {
       const event = JSON.parse(line) as CodexEvent;
-      if (event.type === "thread.started" && typeof event.thread_id === "string") {
+      if (
+        event.type === "thread.started" &&
+        typeof event.thread_id === "string"
+      ) {
         sessionId = event.thread_id;
       }
       if (
@@ -72,7 +75,7 @@ export class CodexProcessor implements Processor {
     const sessionId = this.sessions.get(chatId);
     const args = sessionId
       ? ["exec", "resume", sessionId, "--json", message]
-      : ["exec", "--json", "--sandbox", "workspace-write", message];
+      : ["exec", "--json", message];
 
     try {
       const result = await this.exec(args);
@@ -95,7 +98,10 @@ export class CodexProcessor implements Processor {
     await Promise.all(children.map((child) => this.terminate(child)));
   }
 
-  private terminate(child: ChildProcess, graceMs = SIGKILL_GRACE_MS): Promise<void> {
+  private terminate(
+    child: ChildProcess,
+    graceMs = SIGKILL_GRACE_MS,
+  ): Promise<void> {
     const existing = this.terminationPromises.get(child);
     if (existing) return existing;
 
@@ -134,7 +140,10 @@ export class CodexProcessor implements Processor {
   }
 
   /** Codex is a Node wrapper; signal its whole Linux process group, not just the wrapper. */
-  private signalProcessGroup(child: ChildProcess, signal: NodeJS.Signals): void {
+  private signalProcessGroup(
+    child: ChildProcess,
+    signal: NodeJS.Signals,
+  ): void {
     if (process.platform === "linux" && child.pid) {
       process.kill(-child.pid, signal);
       return;
@@ -176,7 +185,11 @@ export class CodexProcessor implements Processor {
               sessionId: parsed.sessionId,
             });
           } else {
-            reject(new Error(`Codex 进程被信号 ${signal} 中断${errOut ? `: ${errOut.slice(0, 200)}` : ""}`));
+            reject(
+              new Error(
+                `Codex 进程被信号 ${signal} 中断${errOut ? `: ${errOut.slice(0, 200)}` : ""}`,
+              ),
+            );
           }
           return;
         }

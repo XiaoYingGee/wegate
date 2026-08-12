@@ -45,7 +45,7 @@ afterEach(() => {
 });
 
 describe("CodexProcessor", () => {
-  it("starts a workspace-write JSON execution and extracts the thread and final reply", async () => {
+  it("starts a JSON execution using the user's Codex config", async () => {
     const child = new FakeChildProcess();
     mockSpawn(child);
     const processor = new CodexProcessor("/usr/bin/codex", "codex", "/work");
@@ -55,12 +55,12 @@ describe("CodexProcessor", () => {
     await expect(pending).resolves.toEqual({ text: "world" });
     expect(spawn).toHaveBeenCalledWith(
       "/usr/bin/codex",
-      ["exec", "--json", "--sandbox", "workspace-write", "hello"],
+      ["exec", "--json", "hello"],
       expect.objectContaining({ cwd: "/work", detached: true }),
     );
-    expect((spawn as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1]).not.toContain(
-      "--dangerously-bypass-approvals-and-sandbox",
-    );
+    expect(
+      (spawn as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1],
+    ).not.toContain("--sandbox");
   });
 
   it("resumes the stored thread for later messages from the same chat", async () => {
@@ -77,13 +77,9 @@ describe("CodexProcessor", () => {
     emitSuccess(secondChild, "thread-123", "two");
     await expect(second).resolves.toEqual({ text: "two" });
 
-    expect((spawn as unknown as ReturnType<typeof vi.fn>).mock.calls[1][1]).toEqual([
-      "exec",
-      "resume",
-      "thread-123",
-      "--json",
-      "second",
-    ]);
+    expect(
+      (spawn as unknown as ReturnType<typeof vi.fn>).mock.calls[1][1],
+    ).toEqual(["exec", "resume", "thread-123", "--json", "second"]);
   });
 
   it("#clear semantics remove the stored thread", async () => {
@@ -100,13 +96,9 @@ describe("CodexProcessor", () => {
     const second = processor.send("fresh", "chat1");
     emitSuccess(secondChild, "thread-456", "new");
     await second;
-    expect((spawn as unknown as ReturnType<typeof vi.fn>).mock.calls[1][1]).toEqual([
-      "exec",
-      "--json",
-      "--sandbox",
-      "workspace-write",
-      "fresh",
-    ]);
+    expect(
+      (spawn as unknown as ReturnType<typeof vi.fn>).mock.calls[1][1],
+    ).toEqual(["exec", "--json", "fresh"]);
   });
 
   it("returns an error when Codex exits non-zero", async () => {
@@ -127,7 +119,12 @@ describe("CodexProcessor", () => {
     const pending = new CodexProcessor("codex").send("hello", "chat1");
     child.stdout.emit(
       "data",
-      Buffer.from(JSON.stringify({ type: "turn.failed", error: { message: "model unavailable" } })),
+      Buffer.from(
+        JSON.stringify({
+          type: "turn.failed",
+          error: { message: "model unavailable" },
+        }),
+      ),
     );
     child.stderr.emit("data", Buffer.from("generic wrapper error"));
     child.emit("close", 1, null);
@@ -156,10 +153,13 @@ describe("CodexProcessor", () => {
   it("dispose escalates an ignored SIGTERM to SIGKILL", async () => {
     vi.useFakeTimers();
     const child = new FakeChildProcess();
-    const killSpy = vi.spyOn(process, "kill").mockImplementation((_pid, signal) => {
-      if (signal === "SIGKILL") queueMicrotask(() => child.emit("close", null, "SIGKILL"));
-      return true;
-    });
+    const killSpy = vi
+      .spyOn(process, "kill")
+      .mockImplementation((_pid, signal) => {
+        if (signal === "SIGKILL")
+          queueMicrotask(() => child.emit("close", null, "SIGKILL"));
+        return true;
+      });
     mockSpawn(child);
     const processor = new CodexProcessor("codex");
     const pending = processor.send("long", "chat1");
@@ -174,10 +174,13 @@ describe("CodexProcessor", () => {
   it("on the real execution timeout signals the PGID TERM then KILL and settles send", async () => {
     vi.useFakeTimers();
     const child = new FakeChildProcess();
-    const killSpy = vi.spyOn(process, "kill").mockImplementation((_pid, signal) => {
-      if (signal === "SIGKILL") queueMicrotask(() => child.emit("close", null, "SIGKILL"));
-      return true;
-    });
+    const killSpy = vi
+      .spyOn(process, "kill")
+      .mockImplementation((_pid, signal) => {
+        if (signal === "SIGKILL")
+          queueMicrotask(() => child.emit("close", null, "SIGKILL"));
+        return true;
+      });
     mockSpawn(child);
 
     const pending = new CodexProcessor("codex").send("hang", "chat-timeout");
