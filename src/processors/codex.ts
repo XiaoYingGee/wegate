@@ -74,8 +74,15 @@ export class CodexProcessor implements Processor {
   async send(message: string, chatId: string): Promise<ProcessorResponse> {
     const sessionId = this.sessions.get(chatId);
     const args = sessionId
-      ? ["exec", "resume", sessionId, "--json", message]
-      : ["exec", "--json", message];
+      ? [
+          "exec",
+          "resume",
+          sessionId,
+          "--skip-git-repo-check",
+          "--json",
+          message,
+        ]
+      : ["exec", "--skip-git-repo-check", "--json", message];
 
     try {
       const result = await this.exec(args);

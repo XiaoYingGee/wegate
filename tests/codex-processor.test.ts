@@ -55,7 +55,7 @@ describe("CodexProcessor", () => {
     await expect(pending).resolves.toEqual({ text: "world" });
     expect(spawn).toHaveBeenCalledWith(
       "/usr/bin/codex",
-      ["exec", "--json", "hello"],
+      ["exec", "--skip-git-repo-check", "--json", "hello"],
       expect.objectContaining({ cwd: "/work", detached: true }),
     );
     expect(
@@ -79,7 +79,14 @@ describe("CodexProcessor", () => {
 
     expect(
       (spawn as unknown as ReturnType<typeof vi.fn>).mock.calls[1][1],
-    ).toEqual(["exec", "resume", "thread-123", "--json", "second"]);
+    ).toEqual([
+      "exec",
+      "resume",
+      "thread-123",
+      "--skip-git-repo-check",
+      "--json",
+      "second",
+    ]);
   });
 
   it("#clear semantics remove the stored thread", async () => {
@@ -98,7 +105,7 @@ describe("CodexProcessor", () => {
     await second;
     expect(
       (spawn as unknown as ReturnType<typeof vi.fn>).mock.calls[1][1],
-    ).toEqual(["exec", "--json", "fresh"]);
+    ).toEqual(["exec", "--skip-git-repo-check", "--json", "fresh"]);
   });
 
   it("returns an error when Codex exits non-zero", async () => {
