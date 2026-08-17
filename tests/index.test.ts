@@ -1,6 +1,12 @@
-import { describe, it, expect } from "vitest";
-import { buildCommandList, isSenderAllowed } from "../src/index.js";
+import { describe, it, expect, vi } from "vitest";
+import {
+  buildCommandList,
+  flushAllowedPendingOutbox,
+  isSenderAllowed,
+} from "../src/index.js";
 import { Router } from "../src/router.js";
+import type { ILinkClient } from "../src/client/ilink.js";
+import type { SessionStore } from "../src/store/session.js";
 import type { Processor } from "../src/types.js";
 
 describe("isSenderAllowed (BUG-5 sender whitelist)", () => {
@@ -18,6 +24,25 @@ describe("isSenderAllowed (BUG-5 sender whitelist)", () => {
 
   it("rejects a sender not present in the whitelist", () => {
     expect(isSenderAllowed("mallory", ["alice", "bob"])).toBe(false);
+  });
+
+  it("does not let an unauthorized sender trigger pending outbox delivery", async () => {
+    const sendText = vi.fn();
+    const store = {
+      getPeerOutboundStatus: vi.fn(() => {
+        throw new Error("outbox must not be inspected");
+      }),
+    } as unknown as SessionStore;
+
+    const result = await flushAllowedPendingOutbox(
+      { sendText } as unknown as ILinkClient,
+      store,
+      "mallory",
+      ["alice"],
+    );
+
+    expect(result).toBeUndefined();
+    expect(sendText).not.toHaveBeenCalled();
   });
 });
 

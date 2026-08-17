@@ -7,6 +7,7 @@ import { CodexProcessor } from "./processors/codex.js";
 import { HttpProcessor } from "./processors/http.js";
 import { ensureLogin, startMessageLoop } from "./bridge.js";
 import { startApiServer } from "./api.js";
+import { flushPendingOutbox } from "./outbox.js";
 import { loadConfig, getApiToken, getAllowedSenders } from "./config.js";
 import type { Processor } from "./types.js";
 
@@ -52,7 +53,7 @@ async function main(): Promise<void> {
 
   // 3. Start API server
   const server = startApiServer(
-    { client, store, router, apiToken: getApiToken() },
+    { client, store, router, apiToken: getApiToken(), allowedSenders },
     config.apiHost,
     config.apiPort,
   );
@@ -73,12 +74,24 @@ async function main(): Promise<void> {
     log(`← [${from}] ${text}`);
 
     // Sender whitelist gate: must run before ANY routing (including #commands,
-    // which can reach processors directly, e.g. "#claude <msg>"). Reject early
-    // so an unauthorized contact can never reach a processor.
+    // outbox delivery and processors). Reject early so an unauthorized contact
+    // cannot trigger queued outbound messages or reach a processor.
     if (!isSenderAllowed(from, allowedSenders)) {
       logError(`拒绝未授权发送者的消息: ${from}`);
       await reply(client, store, from, "抱歉，你没有权限使用此机器人，该消息未被处理。");
       return;
+    }
+
+    const flushed = await flushAllowedPendingOutbox(
+      client,
+      store,
+      from,
+      allowedSenders,
+    );
+    if (flushed && flushed.attempted > 0) {
+      log(
+        `outbox 补发结果 [${from}]: delivered=${flushed.delivered} remaining=${flushed.remaining}`,
+      );
     }
 
     const parsed = router.parse(text);
@@ -228,6 +241,17 @@ async function sendToProcessor(
 export function isSenderAllowed(from: string, allowedSenders: string[] | undefined): boolean {
   if (!allowedSenders || allowedSenders.length === 0) return true;
   return allowedSenders.includes(from);
+}
+
+/** Defense-in-depth wrapper: callers must not flush an unauthorized peer. */
+export async function flushAllowedPendingOutbox(
+  client: ILinkClient,
+  store: SessionStore,
+  from: string,
+  allowedSenders: string[] | undefined,
+) {
+  if (!isSenderAllowed(from, allowedSenders)) return undefined;
+  return flushPendingOutbox(client, store, from);
 }
 
 async function reply(

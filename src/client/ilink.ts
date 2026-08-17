@@ -59,6 +59,35 @@ export interface SendMessageResponse {
   errmsg?: string;
 }
 
+/**
+ * iLink can return HTTP 200 while rejecting the message at the protocol layer.
+ * Keep the numeric code machine-readable so callers can distinguish a stale
+ * conversation context from a transient transport failure.
+ */
+export class ILinkSendError extends Error {
+  readonly code: number;
+  readonly upstreamMessage: string;
+
+  constructor(code: number, upstreamMessage?: string) {
+    const detail = upstreamMessage || "unknown";
+    super(`sendmessage 业务层失败: errcode=${code} errmsg=${detail}`);
+    this.name = "ILinkSendError";
+    this.code = code;
+    this.upstreamMessage = detail;
+  }
+
+  get contextUnavailable(): boolean {
+    return (
+      this.code === -2 ||
+      /context[_ ]?token|prepare failed/i.test(this.upstreamMessage)
+    );
+  }
+}
+
+export function isContextUnavailableError(err: unknown): boolean {
+  return err instanceof ILinkSendError && err.contextUnavailable;
+}
+
 // ── Client ──
 
 export class ILinkClient {
@@ -151,14 +180,18 @@ export class ILinkClient {
       body,
     );
 
-    const errcode = resp.errcode ?? resp.ret;
+    // Some iLink variants return both fields (for example errcode=0 with a
+    // non-zero ret). Any non-zero business code must win over a zero alias.
+    const errcode =
+      (resp.errcode !== undefined && resp.errcode !== 0 ? resp.errcode : undefined) ??
+      (resp.ret !== undefined && resp.ret !== 0 ? resp.ret : undefined) ??
+      resp.errcode ??
+      resp.ret;
     if (errcode) {
       logError(
         `sendmessage 被 iLink 拒绝: errcode=${errcode} errmsg=${resp.errmsg ?? ""} to=${toUserID} —— 对方可能长时间未活跃，context_token 可能已过期`,
       );
-      throw new Error(
-        `sendmessage 业务层失败: errcode=${errcode} errmsg=${resp.errmsg ?? "unknown"}`,
-      );
+      throw new ILinkSendError(errcode, resp.errmsg);
     }
   }
 

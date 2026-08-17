@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { ILinkClient } from "../src/client/ilink.js";
+import {
+  ILinkClient,
+  ILinkSendError,
+  isContextUnavailableError,
+} from "../src/client/ilink.js";
 
 describe("ILinkClient.sendText", () => {
   afterEach(() => {
@@ -48,6 +52,25 @@ describe("ILinkClient.sendText", () => {
     vi.restoreAllMocks();
   });
 
+  it("classifies ret=-2 prepare failed as an unavailable conversation context", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({ ret: -2, errmsg: "prepare failed" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    const client = new ILinkClient("https://example.com", "tok");
+    const error = await client.sendText("peer1", "hello", "ctx").catch((err) => err);
+
+    expect(error).toBeInstanceOf(ILinkSendError);
+    expect(isContextUnavailableError(error)).toBe(true);
+    expect(error).toMatchObject({ code: -2, upstreamMessage: "prepare failed" });
+
+    vi.restoreAllMocks();
+  });
+
   it("throws when only `ret` (not errcode) signals failure", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
@@ -63,6 +86,21 @@ describe("ILinkClient.sendText", () => {
     );
 
     vi.restoreAllMocks();
+  });
+
+  it("does not let errcode=0 mask a non-zero ret", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({ errcode: 0, ret: -2, errmsg: "prepare failed" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    const client = new ILinkClient("https://example.com", "tok");
+    await expect(client.sendText("peer1", "hello", "ctx")).rejects.toMatchObject({
+      code: -2,
+    });
   });
 
   it("throws a distinct HTTP-layer error when the request itself fails (non-2xx)", async () => {

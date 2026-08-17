@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { SessionStore } from "../src/store/session.js";
+import {
+  CONTEXT_TOKEN_TTL_MS,
+  MAX_OUTBOX_BYTES,
+  MAX_OUTBOX_MESSAGES,
+  OutboxCapacityError,
+  SessionStore,
+} from "../src/store/session.js";
 import { resolve } from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -94,6 +100,96 @@ describe("SessionStore", () => {
       const store2 = new SessionStore(path);
       await store2.load();
       expect(store2.session.get_updates_buf).toBe("cursor_abc");
+    });
+  });
+
+  it("reports a token stale after the official 24-hour reply window", async () => {
+    await withTempStore(async (store) => {
+      store.upsertPeer("peer1", "ctx");
+      const updatedAt = Date.parse(store.session.peers.peer1.context_token_updated_at!);
+
+      expect(store.getPeerOutboundStatus("peer1", updatedAt + CONTEXT_TOKEN_TTL_MS - 1).ready).toBe(true);
+      expect(store.getPeerOutboundStatus("peer1", updatedAt + CONTEXT_TOKEN_TTL_MS)).toMatchObject({
+        ready: false,
+        reason: "stale_context",
+      });
+    });
+  });
+
+  it("marks a rejected context unavailable until a new inbound message refreshes it", async () => {
+    await withTempStore(async (store) => {
+      store.upsertPeer("peer1", "ctx");
+      store.markPeerContextRejected("peer1", "ret=-2 prepare failed");
+      expect(store.getPeerOutboundStatus("peer1")).toMatchObject({
+        ready: false,
+        reason: "context_rejected",
+      });
+
+      const generation = store.getPeerOutboundStatus("peer1").tokenGeneration;
+      store.upsertPeer("peer1", "ctx");
+      expect(store.getPeerOutboundStatus("peer1")).toMatchObject({
+        ready: true,
+        tokenGeneration: generation + 1,
+      });
+    });
+  });
+
+  it("does not let a stale request reject a newer inbound generation", async () => {
+    await withTempStore(async (store) => {
+      store.upsertPeer("peer1", "context-1");
+      const oldGeneration = store.getPeerOutboundStatus("peer1").tokenGeneration;
+      store.upsertPeer("peer1", "context-2");
+
+      expect(
+        store.markPeerContextRejected("peer1", "late ret=-2", oldGeneration),
+      ).toBe(false);
+      expect(store.getPeerOutboundStatus("peer1")).toMatchObject({
+        ready: true,
+        tokenGeneration: oldGeneration + 1,
+        contextToken: "context-2",
+      });
+    });
+  });
+
+  it("persists pending outbox messages", async () => {
+    await withTempStore(async (store, path) => {
+      store.setLogin("tok", "bot", "user", "https://example.com");
+      const entry = store.enqueueOutbox("peer1", "queued reminder");
+      await store.save();
+
+      const reloaded = new SessionStore(path);
+      await reloaded.load();
+      expect(reloaded.listPendingOutbox()).toEqual([
+        expect.objectContaining({
+          id: entry.id,
+          peer_id: "peer1",
+          text: "queued reminder",
+          attempts: 0,
+        }),
+      ]);
+    });
+  });
+
+  it("caps the durable outbox instead of growing the session file forever", async () => {
+    await withTempStore(async (store) => {
+      for (let i = 0; i < MAX_OUTBOX_MESSAGES; i += 1) {
+        store.enqueueOutbox("peer1", `message-${i}`);
+      }
+      expect(() => store.enqueueOutbox("peer1", "one too many")).toThrow(
+        OutboxCapacityError,
+      );
+    });
+  });
+
+  it("accepts exactly 5 MiB of UTF-8 message text and rejects one byte more", async () => {
+    await withTempStore(async (store) => {
+      const threeByteChars = Math.floor(MAX_OUTBOX_BYTES / 3);
+      const remainder = MAX_OUTBOX_BYTES % 3;
+      const exactLimit = "你".repeat(threeByteChars) + "a".repeat(remainder);
+      expect(Buffer.byteLength(exactLimit, "utf8")).toBe(MAX_OUTBOX_BYTES);
+
+      expect(() => store.enqueueOutbox("peer1", exactLimit)).not.toThrow();
+      expect(() => store.enqueueOutbox("peer1", "b")).toThrow(OutboxCapacityError);
     });
   });
 });

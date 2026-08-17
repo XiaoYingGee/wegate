@@ -14,6 +14,7 @@ Wegate lets you **send and receive WeChat messages** programmatically through Te
 - **Codex integration** — `#codex` runs the local Codex CLI with per-chat session resume
 - **HTTP processors** — route messages to any HTTP backend you configure
 - **Push API** — `POST /api/send` lets external services push notifications to WeChat
+- **Durable pending outbox** — stale conversation pushes are queued and retried after the recipient next messages the bot
 - **systemd ready** — runs as a daemon on your server
 
 ## Quick Start
@@ -77,7 +78,7 @@ All config via environment variables:
 | `WEGATE_PROCESSORS` | — | Additional processors as a JSON array — the general way to expose any HTTP backend as a `#<name>` command (see below) |
 | `WEGATE_ASSET_URL` | — | Convenience shortcut equivalent to registering a `WEGATE_PROCESSORS` entry named `asset` with prefix `#asset` — prefer `WEGATE_PROCESSORS` for anything beyond a single extra backend |
 | `WEGATE_API_TOKEN` | — | Optional shared secret; when set, `/api/send` and `/api/status` require a matching `Authorization: Bearer <token>` header |
-| `WEGATE_ALLOWED_SENDERS` | — | Optional comma-separated list of WeChat contact IDs allowed to drive processors (e.g. Claude Code). When unset, any contact who messages the bot can drive it |
+| `WEGATE_ALLOWED_SENDERS` | — | Optional comma-separated list of WeChat contact IDs allowed to drive processors and receive `/api/send` pushes. When unset, any known contact is allowed |
 
 ### Adding Custom Processors
 
@@ -91,6 +92,24 @@ export WEGATE_PROCESSORS='[{"name":"notes","type":"http","prefix":"#notes","url"
 |---|---|---|
 | `POST` | `/api/send` | Push a message to WeChat |
 | `GET` | `/api/status` | Gateway status |
+
+WeChat only permits bot replies for 24 hours after the recipient's latest
+inbound message. There is no protocol endpoint that silently refreshes this
+window. `/api/send` therefore uses these delivery semantics:
+
+- `200`: iLink accepted the message immediately (`delivered: true`).
+- `202`: the conversation context is stale; the message was persisted in the
+  pending outbox (`queued: true`) and will be retried FIFO after the recipient
+  sends any message to the bot.
+- `502`: a transport or unrelated upstream failure; the message was not queued.
+- `507`: the durable outbox reached its safety limit (1,000 messages or 5 MiB
+  of queued message text);
+  the message was not queued.
+
+`/api/status` reports the persisted login session separately from
+`outbound_ready` (`connection_basis: "persisted_session"`),
+including the current peer's context expiry and pending outbox count. A
+`connected` session is not necessarily ready for proactive delivery.
 
 ### Push notification example
 
