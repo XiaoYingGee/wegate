@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
-export const CONTEXT_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 export const MAX_OUTBOX_MESSAGES = 1_000;
 export const MAX_OUTBOX_BYTES = 5 * 1024 * 1024;
 
@@ -18,8 +17,6 @@ export interface PeerInfo {
   last_seen_at?: string;
   context_token_updated_at?: string;
   context_token_generation?: number;
-  context_token_rejected_at?: string;
-  context_token_last_error?: string;
 }
 
 export interface PendingOutboxMessage {
@@ -33,19 +30,15 @@ export interface PendingOutboxMessage {
   last_error?: string;
 }
 
-export type OutboundUnavailableReason =
-  | "no_context_token"
-  | "stale_context"
-  | "context_rejected";
+export type OutboundUnavailableReason = "no_known_peer";
 
 export interface PeerOutboundStatus {
   ready: boolean;
   reason?: OutboundUnavailableReason;
   contextToken?: string;
+  contextTokenAvailable: boolean;
   tokenUpdatedAt?: string;
-  expiresAt?: string;
   tokenGeneration: number;
-  lastError?: string;
 }
 
 export interface SessionData {
@@ -132,21 +125,21 @@ export class SessionStore {
     this.data.get_updates_buf = buf;
   }
 
-  upsertPeer(peerId: string, contextToken?: string) {
+  upsertPeer(peerId: string, contextToken?: string): number {
     const existing = this.data.peers[peerId] || { context_token: "" };
     const now = new Date().toISOString();
     if (contextToken) {
       existing.context_token = contextToken;
       existing.context_token_updated_at = now;
-      // A new inbound message refreshes WeChat's reply window even if the
-      // opaque token string happens to be unchanged.
-      existing.context_token_generation = (existing.context_token_generation || 0) + 1;
-      delete existing.context_token_rejected_at;
-      delete existing.context_token_last_error;
     }
+    // This persisted field predates tokenless sends, but its retry-gate
+    // semantics are the inbound-message generation: every observed inbound
+    // advances it, whether or not iLink supplied a context token.
+    existing.context_token_generation = (existing.context_token_generation || 0) + 1;
     existing.last_seen_at = now;
     this.data.peers[peerId] = existing;
     if (!this.data.current_peer) this.data.current_peer = peerId;
+    return existing.context_token_generation;
   }
 
   getPeerToken(peerId: string): string | undefined {
@@ -157,61 +150,30 @@ export class SessionStore {
     return Object.hasOwn(this.data.peers, peerId);
   }
 
-  getPeerOutboundStatus(peerId: string, now = Date.now()): PeerOutboundStatus {
+  getPeerOutboundStatus(peerId: string): PeerOutboundStatus {
     const peer = this.data.peers[peerId];
     const generation = peer?.context_token_generation || 0;
-    if (!peer?.context_token) {
-      return { ready: false, reason: "no_context_token", tokenGeneration: generation };
+    if (!peer) {
+      return {
+        ready: false,
+        reason: "no_known_peer",
+        contextTokenAvailable: false,
+        tokenGeneration: generation,
+      };
     }
 
-    const tokenUpdatedAt = peer.context_token_updated_at || peer.last_seen_at;
-    const updatedAtMs = tokenUpdatedAt ? Date.parse(tokenUpdatedAt) : Number.NaN;
-    const expiresAt = Number.isFinite(updatedAtMs)
-      ? new Date(updatedAtMs + CONTEXT_TOKEN_TTL_MS).toISOString()
+    const contextToken = peer.context_token || undefined;
+    const tokenUpdatedAt = contextToken
+      ? peer.context_token_updated_at || peer.last_seen_at
       : undefined;
-
-    if (peer.context_token_rejected_at) {
-      return {
-        ready: false,
-        reason: "context_rejected",
-        contextToken: peer.context_token,
-        tokenUpdatedAt,
-        expiresAt,
-        tokenGeneration: generation,
-        lastError: peer.context_token_last_error,
-      };
-    }
-
-    if (!Number.isFinite(updatedAtMs) || now >= updatedAtMs + CONTEXT_TOKEN_TTL_MS) {
-      return {
-        ready: false,
-        reason: "stale_context",
-        contextToken: peer.context_token,
-        tokenUpdatedAt,
-        expiresAt,
-        tokenGeneration: generation,
-      };
-    }
 
     return {
       ready: true,
-      contextToken: peer.context_token,
-      tokenUpdatedAt,
-      expiresAt,
+      contextToken,
+      contextTokenAvailable: !!contextToken,
+      ...(tokenUpdatedAt ? { tokenUpdatedAt } : {}),
       tokenGeneration: generation,
     };
-  }
-
-  markPeerContextRejected(peerId: string, error: string, expectedGeneration?: number): boolean {
-    const peer = this.data.peers[peerId];
-    if (!peer) return false;
-    const currentGeneration = peer.context_token_generation || 0;
-    if (expectedGeneration !== undefined && currentGeneration !== expectedGeneration) {
-      return false;
-    }
-    peer.context_token_rejected_at = new Date().toISOString();
-    peer.context_token_last_error = error;
-    return true;
   }
 
   enqueueOutbox(peerId: string, text: string): PendingOutboxMessage {

@@ -1,7 +1,8 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 
 const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
+export const DEFAULT_SEND_TIMEOUT_MS = 15_000;
 
 const logError = (msg: string, ...args: unknown[]) =>
   console.error(`[wegate] ${msg}`, ...args);
@@ -61,8 +62,9 @@ export interface SendMessageResponse {
 
 /**
  * iLink can return HTTP 200 while rejecting the message at the protocol layer.
- * Keep the numeric code machine-readable so callers can distinguish a stale
- * conversation context from a transient transport failure.
+ * Keep the numeric code machine-readable for diagnostics. The official
+ * client treats any non-zero `ret` as an upstream send failure; Wegate must
+ * not infer context-token expiry from undocumented codes or message text.
  */
 export class ILinkSendError extends Error {
   readonly code: number;
@@ -70,22 +72,23 @@ export class ILinkSendError extends Error {
 
   constructor(code: number, upstreamMessage?: string) {
     const detail = upstreamMessage || "unknown";
-    super(`sendmessage 业务层失败: errcode=${code} errmsg=${detail}`);
+    super(`sendmessage 业务层失败: code=${code} errmsg=${detail}`);
     this.name = "ILinkSendError";
     this.code = code;
     this.upstreamMessage = detail;
   }
-
-  get contextUnavailable(): boolean {
-    return (
-      this.code === -2 ||
-      /context[_ ]?token|prepare failed/i.test(this.upstreamMessage)
-    );
-  }
 }
 
-export function isContextUnavailableError(err: unknown): boolean {
-  return err instanceof ILinkSendError && err.contextUnavailable;
+export class ILinkTimeoutError extends Error {
+  readonly path: string;
+  readonly timeoutMs: number;
+
+  constructor(path: string, timeoutMs: number) {
+    super(`${path} timeout after ${timeoutMs}ms`);
+    this.name = "ILinkTimeoutError";
+    this.path = path;
+    this.timeoutMs = timeoutMs;
+  }
 }
 
 // ── Client ──
@@ -158,7 +161,7 @@ export class ILinkClient {
   async sendText(
     toUserID: string,
     text: string,
-    contextToken: string,
+    contextToken?: string,
   ): Promise<void> {
     // 微信客户端不识别 \n/\r\n 作为换行（实测挤成一行），
     // U+2028 (LINE SEPARATOR) 是实测唯一能在手机/电脑微信都正确换行的编码。
@@ -167,10 +170,10 @@ export class ILinkClient {
       msg: {
         from_user_id: "",
         to_user_id: toUserID,
-        client_id: `wegate-${Date.now()}`,
+        client_id: `wegate-${randomUUID()}`,
         message_type: 2,
         message_state: 2,
-        context_token: contextToken,
+        context_token: contextToken || undefined,
         item_list: [{ type: 1, text_item: { text: wechatText } }],
       },
     };
@@ -178,20 +181,22 @@ export class ILinkClient {
     const resp = await this.postJSON<SendMessageResponse>(
       "/ilink/bot/sendmessage",
       body,
+      undefined,
+      DEFAULT_SEND_TIMEOUT_MS,
     );
 
     // Some iLink variants return both fields (for example errcode=0 with a
     // non-zero ret). Any non-zero business code must win over a zero alias.
-    const errcode =
+    const businessCode =
       (resp.errcode !== undefined && resp.errcode !== 0 ? resp.errcode : undefined) ??
       (resp.ret !== undefined && resp.ret !== 0 ? resp.ret : undefined) ??
       resp.errcode ??
       resp.ret;
-    if (errcode) {
+    if (businessCode) {
       logError(
-        `sendmessage 被 iLink 拒绝: errcode=${errcode} errmsg=${resp.errmsg ?? ""} to=${toUserID} —— 对方可能长时间未活跃，context_token 可能已过期`,
+        `sendmessage 被 iLink 拒绝: code=${businessCode} errmsg=${resp.errmsg ?? ""} to=${toUserID}`,
       );
-      throw new ILinkSendError(errcode, resp.errmsg);
+      throw new ILinkSendError(businessCode, resp.errmsg);
     }
   }
 
@@ -200,26 +205,51 @@ export class ILinkClient {
   private async postJSON<T = unknown>(
     path: string,
     payload: unknown,
-    signal?: AbortSignal,
+    externalSignal?: AbortSignal,
+    timeoutMs?: number,
   ): Promise<T> {
     const bodyBytes = JSON.stringify(payload);
     const headers = this.buildHeaders(bodyBytes);
-
-    const res = await fetch(`${this.baseURL}${path}`, {
-      method: "POST",
-      headers,
-      body: bodyBytes,
-      signal,
-    });
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`${path} HTTP ${res.status}: ${text}`);
+    const controller = timeoutMs !== undefined ? new AbortController() : undefined;
+    let timedOut = false;
+    const onExternalAbort = () => controller?.abort();
+    if (externalSignal && controller) {
+      if (externalSignal.aborted) controller.abort();
+      else externalSignal.addEventListener("abort", onExternalAbort, { once: true });
     }
+    const signal = controller?.signal ?? externalSignal;
+    const timer = controller && timeoutMs !== undefined
+      ? setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, timeoutMs)
+      : undefined;
 
-    const text = await res.text();
-    if (!text) return {} as T;
-    return JSON.parse(text) as T;
+    try {
+      const res = await fetch(`${this.baseURL}${path}`, {
+        method: "POST",
+        headers,
+        body: bodyBytes,
+        signal,
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`${path} HTTP ${res.status}: ${text}`);
+      }
+
+      const text = await res.text();
+      if (!text) return {} as T;
+      return JSON.parse(text) as T;
+    } catch (err) {
+      if (timedOut && timeoutMs !== undefined && isAbortError(err)) {
+        throw new ILinkTimeoutError(path, timeoutMs);
+      }
+      throw err;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      externalSignal?.removeEventListener("abort", onExternalAbort);
+    }
   }
 
   private buildHeaders(body: string): Record<string, string> {

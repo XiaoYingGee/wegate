@@ -14,7 +14,7 @@ Wegate lets you **send and receive WeChat messages** programmatically through Te
 - **Codex integration** — `#codex` runs the local Codex CLI with per-chat session resume
 - **HTTP processors** — route messages to any HTTP backend you configure
 - **Push API** — `POST /api/send` lets external services push notifications to WeChat
-- **Durable pending outbox** — stale conversation pushes are queued and retried after the recipient next messages the bot
+- **Legacy outbox recovery** — pending messages created by older releases get a real iLink attempt at startup
 - **systemd ready** — runs as a daemon on your server
 
 ## Quick Start
@@ -93,23 +93,32 @@ export WEGATE_PROCESSORS='[{"name":"notes","type":"http","prefix":"#notes","url"
 | `POST` | `/api/send` | Push a message to WeChat |
 | `GET` | `/api/status` | Gateway status |
 
-WeChat only permits bot replies for 24 hours after the recipient's latest
-inbound message. There is no protocol endpoint that silently refreshes this
-window. `/api/send` therefore uses these delivery semantics:
+Wegate persists each peer's latest `context_token` and, like Tencent's official
+`openclaw-weixin` channel, reuses it without imposing a local age limit. A
+persisted token is always sent to iLink. If no token has been captured yet,
+Wegate still attempts the send without one, matching the official channel.
+Wegate does not guess that a token has expired based on its age or on
+undocumented errors such as `ret=-2 prepare failed`.
+
+`/api/send` uses these delivery semantics:
 
 - `200`: iLink accepted the message immediately (`delivered: true`).
-- `202`: the conversation context is stale; the message was persisted in the
-  pending outbox (`queued: true`) and will be retried FIFO after the recipient
-  sends any message to the bot.
-- `502`: a transport or unrelated upstream failure; the message was not queued.
-- `507`: the durable outbox reached its safety limit (1,000 messages or 5 MiB
-  of queued message text);
-  the message was not queued.
+- `502`: iLink rejected the send, or a transport failure occurred; the real
+  upstream error is returned and the message is not queued. Ordinary sends use
+  a 15-second timeout; long-polling keeps its separate timeout behavior.
+
+New `/api/send` requests are never queued before contacting iLink. Releases
+that used the former local-expiry heuristic may already have messages in the
+persisted outbox. During startup, each peer's entries are attempted in FIFO
+order. Delivery stops at that peer's first real upstream failure, preserving
+the failed entry and every later entry for a future recovery attempt.
 
 `/api/status` reports the persisted login session separately from
-`outbound_ready` (`connection_basis: "persisted_session"`),
-including the current peer's context expiry and pending outbox count. A
-`connected` session is not necessarily ready for proactive delivery.
+`outbound_ready` (`connection_basis: "persisted_session"`). A known peer is
+outbound-ready even without a token because iLink is still attempted.
+`context_token_available` reports whether a token will be included, while
+`token_updated_at` is informational and is not an expiry time. Pending outbox
+counts refer only to legacy recovery entries.
 
 ### Push notification example
 

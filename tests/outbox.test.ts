@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
-import { ILinkSendError, type ILinkClient } from "../src/client/ilink.js";
+import type { ILinkClient } from "../src/client/ilink.js";
 import { flushPendingOutbox } from "../src/outbox.js";
 import { SessionStore } from "../src/store/session.js";
 
@@ -16,12 +16,12 @@ async function withStore(fn: (store: SessionStore) => Promise<void>) {
 }
 
 describe("pending outbox recovery", () => {
-  it("flushes queued messages FIFO after a fresh inbound context", async () => {
+  it("flushes legacy queued messages FIFO with the stored context token", async () => {
     await withStore(async (store) => {
       vi.spyOn(console, "log").mockImplementation(() => {});
       store.enqueueOutbox("peer1", "first");
       store.enqueueOutbox("peer1", "second");
-      store.upsertPeer("peer1", "fresh-context");
+      const generation = store.upsertPeer("peer1", "fresh-context");
 
       const sent: string[] = [];
       const client = {
@@ -30,7 +30,10 @@ describe("pending outbox recovery", () => {
         }),
       } as unknown as ILinkClient;
 
-      const result = await flushPendingOutbox(client, store, "peer1");
+      const result = await flushPendingOutbox(client, store, "peer1", {
+        mode: "inbound",
+        attemptGeneration: generation,
+      });
 
       expect(sent).toEqual(["first", "second"]);
       expect(result).toEqual({ attempted: 2, delivered: 2, remaining: 0 });
@@ -43,14 +46,15 @@ describe("pending outbox recovery", () => {
     await withStore(async (store) => {
       vi.spyOn(console, "error").mockImplementation(() => {});
       store.enqueueOutbox("peer1", "reminder");
-      store.upsertPeer("peer1", "fresh-context");
+      const generation = store.upsertPeer("peer1", "fresh-context");
       const sendText = vi.fn(async () => {
         throw new Error("temporary network failure");
       });
       const client = { sendText } as unknown as ILinkClient;
 
-      const first = await flushPendingOutbox(client, store, "peer1");
-      const second = await flushPendingOutbox(client, store, "peer1");
+      const options = { mode: "inbound", attemptGeneration: generation } as const;
+      const first = await flushPendingOutbox(client, store, "peer1", options);
+      const second = await flushPendingOutbox(client, store, "peer1", options);
 
       expect(first).toMatchObject({ attempted: 1, delivered: 0, remaining: 1 });
       expect(second).toEqual({ attempted: 0, delivered: 0, remaining: 1 });
@@ -63,21 +67,81 @@ describe("pending outbox recovery", () => {
     });
   });
 
+  it("does not skip a failed FIFO head until a new inbound generation", async () => {
+    await withStore(async (store) => {
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      store.enqueueOutbox("peer1", "first");
+      store.enqueueOutbox("peer1", "second");
+      const firstGeneration = store.upsertPeer("peer1", "context-1");
+      const sendText = vi
+        .fn()
+        .mockRejectedValueOnce(new Error("temporary failure"))
+        .mockResolvedValue(undefined);
+      const client = { sendText } as unknown as ILinkClient;
+
+      const firstOptions = {
+        mode: "inbound",
+        attemptGeneration: firstGeneration,
+      } as const;
+      const failed = await flushPendingOutbox(client, store, "peer1", firstOptions);
+      const sameGeneration = await flushPendingOutbox(
+        client,
+        store,
+        "peer1",
+        firstOptions,
+      );
+
+      expect(failed).toMatchObject({ attempted: 1, delivered: 0, remaining: 2 });
+      expect(sameGeneration).toEqual({ attempted: 0, delivered: 0, remaining: 2 });
+      expect(sendText).toHaveBeenCalledTimes(1);
+      expect(store.listPendingOutbox("peer1").map((entry) => entry.text)).toEqual([
+        "first",
+        "second",
+      ]);
+
+      const secondGeneration = store.upsertPeer("peer1", "context-2");
+      const nextGeneration = await flushPendingOutbox(client, store, "peer1", {
+        mode: "inbound",
+        attemptGeneration: secondGeneration,
+      });
+
+      expect(nextGeneration).toEqual({ attempted: 2, delivered: 2, remaining: 0 });
+      expect(sendText.mock.calls.map(([, text]) => text)).toEqual([
+        "first",
+        "first",
+        "second",
+      ]);
+      expect(sendText.mock.calls.slice(1).map(([, , token]) => token)).toEqual([
+        "context-2",
+        "context-2",
+      ]);
+      expect(store.listPendingOutbox("peer1")).toEqual([]);
+      vi.restoreAllMocks();
+    });
+  });
+
   it("retries once after the next inbound advances the context generation", async () => {
     await withStore(async (store) => {
       vi.spyOn(console, "log").mockImplementation(() => {});
       vi.spyOn(console, "error").mockImplementation(() => {});
       store.enqueueOutbox("peer1", "reminder");
-      store.upsertPeer("peer1", "context-1");
+      const firstGeneration = store.upsertPeer("peer1", "context-1");
       const sendText = vi
         .fn()
         .mockRejectedValueOnce(new Error("temporary failure"))
         .mockResolvedValueOnce(undefined);
       const client = { sendText } as unknown as ILinkClient;
 
-      await flushPendingOutbox(client, store, "peer1");
-      store.upsertPeer("peer1", "context-2");
-      const recovered = await flushPendingOutbox(client, store, "peer1");
+      await flushPendingOutbox(client, store, "peer1", {
+        mode: "inbound",
+        attemptGeneration: firstGeneration,
+      });
+      const secondGeneration = store.upsertPeer("peer1", "context-2");
+      const recovered = await flushPendingOutbox(client, store, "peer1", {
+        mode: "inbound",
+        attemptGeneration: secondGeneration,
+      });
 
       expect(sendText).toHaveBeenCalledTimes(2);
       expect(sendText.mock.calls[1]?.[2]).toBe("context-2");
@@ -86,61 +150,71 @@ describe("pending outbox recovery", () => {
     });
   });
 
-  it("does not let an old in-flight failure invalidate a newer inbound context", async () => {
+  it("retries a tokenless legacy FIFO only after the next tokenless inbound", async () => {
     await withStore(async (store) => {
       vi.spyOn(console, "log").mockImplementation(() => {});
       vi.spyOn(console, "error").mockImplementation(() => {});
-      store.enqueueOutbox("peer1", "reminder");
-      store.upsertPeer("peer1", "context-1");
-
-      let rejectOld!: (error: unknown) => void;
-      let signalStarted!: () => void;
-      const started = new Promise<void>((resolve) => { signalStarted = resolve; });
-      const oldRequest = new Promise<void>((_resolve, reject) => { rejectOld = reject; });
+      store.enqueueOutbox("peer1", "first");
+      store.enqueueOutbox("peer1", "second");
+      const firstGeneration = store.upsertPeer("peer1");
       const sendText = vi
         .fn()
-        .mockImplementationOnce(async () => {
-          signalStarted();
-          return oldRequest;
-        })
-        .mockResolvedValueOnce(undefined);
+        .mockRejectedValueOnce(new Error("old startup failure"))
+        .mockResolvedValue(undefined);
       const client = { sendText } as unknown as ILinkClient;
 
-      const firstFlush = flushPendingOutbox(client, store, "peer1");
-      await started;
-      store.upsertPeer("peer1", "context-2");
-      rejectOld(new ILinkSendError(-2, "prepare failed"));
-      await firstFlush;
-
-      expect(store.getPeerOutboundStatus("peer1")).toMatchObject({
-        ready: true,
-        contextToken: "context-2",
+      const startup = await flushPendingOutbox(client, store, "peer1", {
+        mode: "startup",
       });
-      const recovered = await flushPendingOutbox(client, store, "peer1");
-      expect(recovered).toEqual({ attempted: 1, delivered: 1, remaining: 0 });
-      expect(sendText.mock.calls[1]?.[2]).toBe("context-2");
+      const sameGeneration = await flushPendingOutbox(client, store, "peer1", {
+        mode: "inbound",
+        attemptGeneration: firstGeneration,
+      });
+
+      expect(startup).toMatchObject({ attempted: 1, delivered: 0, remaining: 2 });
+      expect(sameGeneration).toEqual({ attempted: 0, delivered: 0, remaining: 2 });
+      expect(sendText.mock.calls.map(([, text]) => text)).toEqual(["first"]);
+      expect(store.listPendingOutbox("peer1").map((entry) => entry.text)).toEqual([
+        "first",
+        "second",
+      ]);
+
+      const secondGeneration = store.upsertPeer("peer1");
+      const nextGeneration = await flushPendingOutbox(client, store, "peer1", {
+        mode: "inbound",
+        attemptGeneration: secondGeneration,
+      });
+
+      expect(nextGeneration).toEqual({ attempted: 2, delivered: 2, remaining: 0 });
+      expect(sendText.mock.calls.map(([, text]) => text)).toEqual([
+        "first",
+        "first",
+        "second",
+      ]);
+      expect(sendText.mock.calls.every(([, , token]) => token === undefined)).toBe(true);
+      expect(store.listPendingOutbox("peer1")).toEqual([]);
       vi.restoreAllMocks();
     });
   });
 
-  it("marks ret=-2 as context rejected and leaves later FIFO items untouched", async () => {
+  it("does not reinterpret an upstream failure as context-token rejection", async () => {
     await withStore(async (store) => {
       vi.spyOn(console, "error").mockImplementation(() => {});
       store.enqueueOutbox("peer1", "first");
       store.enqueueOutbox("peer1", "second");
-      store.upsertPeer("peer1", "fresh-context");
+      const generation = store.upsertPeer("peer1", "fresh-context");
       const client = {
         sendText: vi.fn(async () => {
-          throw new ILinkSendError(-2, "prepare failed");
+          throw new Error("sendmessage ret=-2 errmsg=prepare failed");
         }),
       } as unknown as ILinkClient;
 
-      await flushPendingOutbox(client, store, "peer1");
-
-      expect(store.getPeerOutboundStatus("peer1")).toMatchObject({
-        ready: false,
-        reason: "context_rejected",
+      await flushPendingOutbox(client, store, "peer1", {
+        mode: "inbound",
+        attemptGeneration: generation,
       });
+
+      expect(store.getPeerOutboundStatus("peer1").ready).toBe(true);
       expect(store.listPendingOutbox("peer1").map((entry) => entry.text)).toEqual([
         "first",
         "second",

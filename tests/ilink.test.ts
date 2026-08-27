@@ -1,12 +1,14 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import {
+  DEFAULT_SEND_TIMEOUT_MS,
   ILinkClient,
   ILinkSendError,
-  isContextUnavailableError,
+  ILinkTimeoutError,
 } from "../src/client/ilink.js";
 
-describe("ILinkClient.sendText", () => {
+describe("ILinkClient", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
@@ -35,24 +37,120 @@ describe("ILinkClient.sendText", () => {
     vi.restoreAllMocks();
   });
 
-  it("throws with errcode/errmsg when iLink rejects at the application layer (e.g. expired context_token)", async () => {
+  it("sends without a context_token when none has been captured", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify({ ret: 0 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    const client = new ILinkClient("https://example.com", "tok");
+    await client.sendText("peer1", "hello");
+
+    const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.msg).not.toHaveProperty("context_token");
+  });
+
+  it("generates a unique client_id for concurrent sends", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+    const requestBodies: Array<{ msg: { client_id: string } }> = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_url, init) => {
+      requestBodies.push(JSON.parse(init?.body as string));
+      return new Response(JSON.stringify({ ret: 0 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const client = new ILinkClient("https://example.com", "tok");
+    await Promise.all(
+      Array.from({ length: 20 }, (_, index) =>
+        client.sendText("peer1", `message-${index}`, "ctx"),
+      ),
+    );
+
+    const clientIds = requestBodies.map(({ msg }) => msg.client_id);
+    expect(clientIds).toHaveLength(20);
+    expect(new Set(clientIds).size).toBe(clientIds.length);
+    expect(
+      clientIds.every((id) =>
+        /^wegate-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(id),
+      ),
+    ).toBe(true);
+  });
+
+  it("aborts an ordinary send after the official 15-second timeout", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(globalThis, "fetch").mockImplementationOnce(async (_url, init) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("aborted", "AbortError")),
+          { once: true },
+        );
+      });
+    });
+
+    const client = new ILinkClient("https://example.com", "tok");
+    const send = client.sendText("peer1", "hello", "ctx");
+    const rejection = send.catch((err: unknown) => err);
+
+    await vi.advanceTimersByTimeAsync(DEFAULT_SEND_TIMEOUT_MS);
+    const error = await rejection;
+    expect(error).toBeInstanceOf(ILinkTimeoutError);
+    expect(error).toMatchObject({
+      name: "ILinkTimeoutError",
+      path: "/ilink/bot/sendmessage",
+      timeoutMs: DEFAULT_SEND_TIMEOUT_MS,
+    });
+  });
+
+  it("keeps getUpdates on its independent long-poll timeout path", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(globalThis, "fetch").mockImplementationOnce(async (_url, init) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("aborted", "AbortError")),
+          { once: true },
+        );
+      });
+    });
+
+    const client = new ILinkClient("https://example.com", "tok");
+    const poll = client.getUpdates("cursor", "1.0.2", 1_000);
+    const result = expect(poll).resolves.toEqual({
+      ret: 0,
+      msgs: [],
+      get_updates_buf: "cursor",
+    });
+
+    // getUpdates retains its existing timeoutMs + 5s abort allowance and is
+    // not converted into the ordinary-send ILinkTimeoutError.
+    await vi.advanceTimersByTimeAsync(6_000);
+    await result;
+  });
+
+  it("throws with code/errmsg when iLink rejects at the application layer", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
       new Response(
-        JSON.stringify({ errcode: 10008, errmsg: "context_token expired" }),
+        JSON.stringify({ errcode: 10008, errmsg: "request rejected" }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       ),
     );
 
     const client = new ILinkClient("https://example.com", "tok");
     await expect(client.sendText("peer1", "hello", "ctx")).rejects.toThrow(
-      /errcode=10008.*context_token expired/,
+      /code=10008.*request rejected/,
     );
 
     vi.restoreAllMocks();
   });
 
-  it("classifies ret=-2 prepare failed as an unavailable conversation context", async () => {
+  it("preserves ret=-2 prepare failed as a generic upstream send error", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
       new Response(JSON.stringify({ ret: -2, errmsg: "prepare failed" }), {
@@ -65,7 +163,6 @@ describe("ILinkClient.sendText", () => {
     const error = await client.sendText("peer1", "hello", "ctx").catch((err) => err);
 
     expect(error).toBeInstanceOf(ILinkSendError);
-    expect(isContextUnavailableError(error)).toBe(true);
     expect(error).toMatchObject({ code: -2, upstreamMessage: "prepare failed" });
 
     vi.restoreAllMocks();

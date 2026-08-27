@@ -64,7 +64,12 @@ export async function ensureLogin(
   throw new Error("登录超时");
 }
 
-export type MessageHandler = (from: string, text: string, msg: WeixinMessage) => Promise<void> | void;
+export type MessageHandler = (
+  from: string,
+  text: string,
+  msg: WeixinMessage,
+  inboundGeneration: number,
+) => Promise<void> | void;
 
 /**
  * 将 key 相同的任务串行排队执行（保证同一联系人的消息按到达顺序处理），
@@ -105,8 +110,15 @@ export async function startMessageLoop(
     try {
       const resp = await client.getUpdates(store.session.get_updates_buf, "1.0.2", timeoutMs);
 
-      if (resp.errcode) {
-        logError(`getUpdates 错误: errcode=${resp.errcode} errmsg=${resp.errmsg}`);
+      const businessCode =
+        (resp.errcode !== undefined && resp.errcode !== 0
+          ? resp.errcode
+          : undefined) ??
+        (resp.ret !== undefined && resp.ret !== 0 ? resp.ret : undefined);
+      if (businessCode !== undefined) {
+        logError(
+          `getUpdates 上游失败: code=${businessCode} errmsg=${resp.errmsg ?? ""}`,
+        );
         await sleep(5000);
         continue;
       }
@@ -115,35 +127,59 @@ export async function startMessageLoop(
         timeoutMs = resp.longpolling_timeout_ms;
       }
 
+      const batchTasks: Promise<void>[] = [];
+      const batchErrors: unknown[] = [];
+
       if (resp.msgs) {
         for (const msg of resp.msgs) {
           const from = msg.from_user_id?.trim();
           if (!from) continue;
 
           try {
-            store.upsertPeer(from, msg.context_token?.trim());
+            const inboundGeneration = store.upsertPeer(
+              from,
+              msg.context_token?.trim(),
+            );
             await store.save();
 
             const text = extractText(msg);
-            enqueueSerial(
+            const task = enqueueSerial(
               pending,
               from,
-              () => onMessage(from, text, msg),
-              (err) => logError(`消息处理异常 [${from}]:`, err),
+              () => onMessage(from, text, msg, inboundGeneration),
+              (err) => {
+                batchErrors.push(err);
+                logError(`消息处理异常 [${from}]:`, err);
+              },
             );
+            batchTasks.push(task);
           } catch (err) {
+            batchErrors.push(err);
             logError(`消息持久化/入队异常 [${from}]，跳过该条继续处理后续消息:`, err);
           }
         }
       }
 
-      // 游标必须在本批消息全部入队之后才推进：若在此之前崩溃，下次重启会
-      // 用旧游标重新拉取整批消息（可能重复处理），而不是让游标先行、
-      // 一旦崩溃就永久丢失尚未入队的消息（at-most-once → at-least-once）。
+      // Cursor advancement is the batch commit: all handlers must finish
+      // successfully first. A failed batch keeps the old cursor so iLink can
+      // redeliver it after backoff (at-least-once processing).
+      await Promise.all(batchTasks);
+      if (batchErrors.length > 0) {
+        logError(`本批消息处理失败 ${batchErrors.length} 条，保留旧 cursor 后重试`);
+        await sleep(5000);
+        continue;
+      }
+
       const newBuf = resp.get_updates_buf || resp.sync_buf;
       if (newBuf && newBuf !== store.session.get_updates_buf) {
+        const previousBuf = store.session.get_updates_buf;
         store.setUpdatesBuf(newBuf);
-        await store.save();
+        try {
+          await store.save();
+        } catch (err) {
+          store.setUpdatesBuf(previousBuf);
+          throw err;
+        }
       }
     } catch (err) {
       logError("长轮询异常:", err);

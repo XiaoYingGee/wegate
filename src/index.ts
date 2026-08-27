@@ -15,6 +15,7 @@ const log = (msg: string, ...args: unknown[]) =>
   console.log(`[wegate] ${msg}`, ...args);
 const logError = (msg: string, ...args: unknown[]) =>
   console.error(`[wegate] ${msg}`, ...args);
+const MAX_REPLY_CHUNK_CODE_UNITS = 2_000;
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -69,8 +70,13 @@ async function main(): Promise<void> {
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
 
-  // 5. Start message loop
-  startMessageLoop(client, store, async (from, text) => {
+  // 5. Recover legacy outbox entries after HTTP is available. The message
+  // loop starts only after this finishes, so inbound-triggered recovery cannot
+  // race the startup migration.
+  await flushLegacyPendingOutbox(client, store, allowedSenders);
+
+  // 6. Start message loop
+  startMessageLoop(client, store, async (from, text, _msg, inboundGeneration) => {
     log(`← [${from}] ${text}`);
 
     // Sender whitelist gate: must run before ANY routing (including #commands,
@@ -87,6 +93,7 @@ async function main(): Promise<void> {
       store,
       from,
       allowedSenders,
+      inboundGeneration,
     );
     if (flushed && flushed.attempted > 0) {
       log(
@@ -249,12 +256,37 @@ export async function flushAllowedPendingOutbox(
   store: SessionStore,
   from: string,
   allowedSenders: string[] | undefined,
+  inboundGeneration: number,
 ) {
   if (!isSenderAllowed(from, allowedSenders)) return undefined;
-  return flushPendingOutbox(client, store, from);
+  return flushPendingOutbox(client, store, from, {
+    mode: "inbound",
+    attemptGeneration: inboundGeneration,
+  });
 }
 
-async function reply(
+/** One-time startup recovery for pending messages created by older releases. */
+export async function flushLegacyPendingOutbox(
+  client: ILinkClient,
+  store: SessionStore,
+  allowedSenders: string[] | undefined,
+) {
+  const peerIds = Array.from(
+    new Set(store.listPendingOutbox().map((entry) => entry.peer_id)),
+  ).filter((peerId) => isSenderAllowed(peerId, allowedSenders));
+
+  for (const peerId of peerIds) {
+    const result = await flushPendingOutbox(client, store, peerId, {
+      mode: "startup",
+    });
+    log(
+      `legacy outbox 启动恢复 [${peerId}]: attempted=${result.attempted} ` +
+      `delivered=${result.delivered} remaining=${result.remaining}`,
+    );
+  }
+}
+
+export async function reply(
   client: ILinkClient,
   store: SessionStore,
   to: string,
@@ -262,13 +294,10 @@ async function reply(
 ): Promise<void> {
   const token = store.getPeerToken(to);
   if (!token) {
-    logError(`无法回复 ${to}: 没有 context_token`);
-    return;
+    log(`回复 ${to} 时没有 context_token，仍调用 iLink 发送`);
   }
 
-  const maxLen = 2000;
-
-  if (text.length <= maxLen) {
+  if (text.length <= MAX_REPLY_CHUNK_CODE_UNITS) {
     try {
       await client.sendText(to, text, token);
       log(`→ [${to}] ${text.slice(0, 80)}${text.length > 80 ? "..." : ""}`);
@@ -278,12 +307,11 @@ async function reply(
     return;
   }
 
-  const totalChunks = Math.ceil(text.length / maxLen);
-  let chunkIndex = 0;
+  const chunks = splitReplyText(text);
+  const totalChunks = chunks.length;
 
-  for (let i = 0; i < text.length; i += maxLen) {
-    chunkIndex += 1;
-    const chunk = text.slice(i, i + maxLen);
+  for (const [index, chunk] of chunks.entries()) {
+    const chunkIndex = index + 1;
 
     try {
       await client.sendText(to, chunk, token);
@@ -303,6 +331,24 @@ async function reply(
   }
 
   log(`→ [${to}] (${totalChunks} 条分段消息)`);
+}
+
+/** Split on code-point boundaries while retaining the existing UTF-16 limit. */
+function splitReplyText(text: string): string[] {
+  const chunks: string[] = [];
+  let chunk = "";
+
+  for (const codePoint of text) {
+    if (chunk.length + codePoint.length > MAX_REPLY_CHUNK_CODE_UNITS) {
+      chunks.push(chunk);
+      chunk = codePoint;
+    } else {
+      chunk += codePoint;
+    }
+  }
+
+  if (chunk) chunks.push(chunk);
+  return chunks;
 }
 
 // Guard against auto-running main() when this module is imported (e.g. by

@@ -1,13 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
-  CONTEXT_TOKEN_TTL_MS,
   MAX_OUTBOX_BYTES,
   MAX_OUTBOX_MESSAGES,
   OutboxCapacityError,
   SessionStore,
 } from "../src/store/session.js";
 import { resolve } from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 
 async function withTempStore(
@@ -74,6 +73,22 @@ describe("SessionStore", () => {
     });
   });
 
+  it("advances the inbound generation without clearing a stored token", async () => {
+    await withTempStore(async (store) => {
+      store.upsertPeer("peer1", "stored-token");
+      const before = store.getPeerOutboundStatus("peer1");
+
+      store.upsertPeer("peer1");
+
+      expect(store.getPeerOutboundStatus("peer1")).toMatchObject({
+        contextToken: "stored-token",
+        contextTokenAvailable: true,
+        tokenUpdatedAt: before.tokenUpdatedAt,
+        tokenGeneration: before.tokenGeneration + 1,
+      });
+    });
+  });
+
   it("returns undefined for unknown peer", async () => {
     await withTempStore(async (store) => {
       expect(store.getPeerToken("unknown")).toBeUndefined();
@@ -103,50 +118,93 @@ describe("SessionStore", () => {
     });
   });
 
-  it("reports a token stale after the official 24-hour reply window", async () => {
+  it("keeps persisted context tokens ready regardless of age", async () => {
     await withTempStore(async (store) => {
       store.upsertPeer("peer1", "ctx");
-      const updatedAt = Date.parse(store.session.peers.peer1.context_token_updated_at!);
+      store.session.peers.peer1.context_token_updated_at = "2020-01-01T00:00:00.000Z";
 
-      expect(store.getPeerOutboundStatus("peer1", updatedAt + CONTEXT_TOKEN_TTL_MS - 1).ready).toBe(true);
-      expect(store.getPeerOutboundStatus("peer1", updatedAt + CONTEXT_TOKEN_TTL_MS)).toMatchObject({
-        ready: false,
-        reason: "stale_context",
+      expect(store.getPeerOutboundStatus("peer1")).toMatchObject({
+        ready: true,
+        contextToken: "ctx",
+        contextTokenAvailable: true,
+        tokenUpdatedAt: "2020-01-01T00:00:00.000Z",
       });
     });
   });
 
-  it("marks a rejected context unavailable until a new inbound message refreshes it", async () => {
-    await withTempStore(async (store) => {
-      store.upsertPeer("peer1", "ctx");
-      store.markPeerContextRejected("peer1", "ret=-2 prepare failed");
-      expect(store.getPeerOutboundStatus("peer1")).toMatchObject({
-        ready: false,
-        reason: "context_rejected",
-      });
+  it("loads and re-saves a legacy session file without reviving rejection heuristics", async () => {
+    await withTempStore(async (store, path) => {
+      await writeFile(
+        path,
+        JSON.stringify({
+          bot_token: "legacy-token",
+          bot_id: "legacy-bot",
+          user_id: "legacy-user",
+          base_url: "https://example.com",
+          get_updates_buf: "legacy-cursor",
+          current_peer: "peer1",
+          peers: {
+            peer1: {
+              context_token: "ctx",
+              last_seen_at: "2026-08-20T00:00:00.000Z",
+              context_token_updated_at: "2026-08-20T00:00:00.000Z",
+              context_token_generation: 4,
+              context_token_rejected_at: "2026-08-20T00:01:00.000Z",
+              context_token_last_error: "ret=-2 prepare failed",
+            },
+          },
+          saved_at: "2026-08-20T00:02:00.000Z",
+        }),
+      );
 
-      const generation = store.getPeerOutboundStatus("peer1").tokenGeneration;
-      store.upsertPeer("peer1", "ctx");
+      expect(await store.load()).toBe(true);
       expect(store.getPeerOutboundStatus("peer1")).toMatchObject({
         ready: true,
-        tokenGeneration: generation + 1,
+        contextToken: "ctx",
+        tokenGeneration: 4,
+      });
+      expect(store.listPendingOutbox()).toEqual([]);
+
+      await store.save();
+      const saved = JSON.parse(await readFile(path, "utf8")) as {
+        pending_outbox?: unknown[];
+        peers: Record<string, Record<string, unknown>>;
+      };
+      expect(saved.pending_outbox).toEqual([]);
+      expect(saved.peers.peer1).toMatchObject({
+        context_token: "ctx",
+        context_token_rejected_at: "2026-08-20T00:01:00.000Z",
+        context_token_last_error: "ret=-2 prepare failed",
+      });
+
+      const reloaded = new SessionStore(path);
+      expect(await reloaded.load()).toBe(true);
+      expect(reloaded.getPeerOutboundStatus("peer1")).toMatchObject({
+        ready: true,
+        contextToken: "ctx",
+        tokenGeneration: 4,
       });
     });
   });
 
-  it("does not let a stale request reject a newer inbound generation", async () => {
+  it("keeps a known peer outbound-ready even without a context token", async () => {
     await withTempStore(async (store) => {
-      store.upsertPeer("peer1", "context-1");
-      const oldGeneration = store.getPeerOutboundStatus("peer1").tokenGeneration;
-      store.upsertPeer("peer1", "context-2");
-
-      expect(
-        store.markPeerContextRejected("peer1", "late ret=-2", oldGeneration),
-      ).toBe(false);
-      expect(store.getPeerOutboundStatus("peer1")).toMatchObject({
+      store.upsertPeer("peer1");
+      const status = store.getPeerOutboundStatus("peer1");
+      expect(status).toMatchObject({
         ready: true,
-        tokenGeneration: oldGeneration + 1,
-        contextToken: "context-2",
+        contextTokenAvailable: false,
+      });
+      expect(status).not.toHaveProperty("tokenUpdatedAt");
+    });
+  });
+
+  it("reports an unknown peer as unavailable", async () => {
+    await withTempStore(async (store) => {
+      expect(store.getPeerOutboundStatus("unknown")).toMatchObject({
+        ready: false,
+        reason: "no_known_peer",
+        contextTokenAvailable: false,
       });
     });
   });
