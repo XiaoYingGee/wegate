@@ -372,7 +372,7 @@ describe("startMessageLoop — per-message inbound generation", () => {
     vi.restoreAllMocks();
   });
 
-  it("lets the second same-peer message retry an outbox item failed by the first", async () => {
+  it("lets a later token-bearing same-peer message retry an outbox item", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
     const dir = await mkdtemp(resolve(tmpdir(), "wegate-bridge-generation-test-"));
@@ -394,10 +394,12 @@ describe("startMessageLoop — per-message inbound generation", () => {
       const msgs: WeixinMessage[] = [
         {
           from_user_id: "peer1",
+          context_token: "context-1",
           item_list: [{ type: 1, text_item: { text: "first inbound" } }],
         },
         {
           from_user_id: "peer1",
+          context_token: "context-2",
           item_list: [{ type: 1, text_item: { text: "second inbound" } }],
         },
       ];
@@ -418,7 +420,7 @@ describe("startMessageLoop — per-message inbound generation", () => {
         async (
           from: string,
           _text: string,
-          _msg: WeixinMessage,
+          msg: WeixinMessage,
           inboundGeneration: number,
         ) => {
           handlerGenerations.push(inboundGeneration);
@@ -433,6 +435,7 @@ describe("startMessageLoop — per-message inbound generation", () => {
               from,
               undefined,
               inboundGeneration,
+              msg.context_token,
             ),
           );
         },
@@ -458,9 +461,10 @@ describe("startMessageLoop — per-message inbound generation", () => {
         remaining: 0,
       });
       expect(sendText.mock.calls).toEqual([
-        ["peer1", "legacy message", undefined],
-        ["peer1", "legacy message", undefined],
+        ["peer1", "legacy message", "context-2", expect.stringMatching(/^wegate-/)],
+        ["peer1", "legacy message", "context-2", expect.stringMatching(/^wegate-/)],
       ]);
+      expect(sendText.mock.calls[1]?.[3]).toBe(sendText.mock.calls[0]?.[3]);
       expect(store.listPendingOutbox("peer1")).toEqual([]);
     } finally {
       await rm(dir, { recursive: true, force: true });

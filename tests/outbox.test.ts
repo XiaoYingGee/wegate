@@ -5,6 +5,7 @@ import { resolve } from "node:path";
 import type { ILinkClient } from "../src/client/ilink.js";
 import { flushPendingOutbox } from "../src/outbox.js";
 import { SessionStore } from "../src/store/session.js";
+import { MAX_OUTBOX_BYTES } from "../src/store/session.js";
 
 async function withStore(fn: (store: SessionStore) => Promise<void>) {
   const dir = await mkdtemp(resolve(tmpdir(), "wegate-outbox-test-"));
@@ -13,6 +14,16 @@ async function withStore(fn: (store: SessionStore) => Promise<void>) {
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 describe("pending outbox recovery", () => {
@@ -39,6 +50,146 @@ describe("pending outbox recovery", () => {
       expect(result).toEqual({ attempted: 2, delivered: 2, remaining: 0 });
       expect(store.listPendingOutbox("peer1")).toEqual([]);
       vi.restoreAllMocks();
+    });
+  });
+
+  it("does not replay a newly queued fallback failure during startup", async () => {
+    await withStore(async (store) => {
+      const generation = store.upsertPeer("peer1", "stale-context");
+      store.enqueueOutbox("peer1", "wait for a new token", {
+        generation,
+        error: "tokenless request rejected",
+        clientId: "wegate-new-queued-id",
+      });
+      const sendText = vi.fn(async () => {});
+
+      const result = await flushPendingOutbox(
+        { sendText } as unknown as ILinkClient,
+        store,
+        "peer1",
+        { mode: "startup" },
+      );
+
+      expect(result).toEqual({ attempted: 0, delivered: 0, remaining: 1 });
+      expect(sendText).not.toHaveBeenCalled();
+      expect(store.listPendingOutbox("peer1")).toHaveLength(1);
+
+      const refreshedGeneration = store.upsertPeer("peer1", "new-context");
+      const refreshed = await flushPendingOutbox(
+        { sendText } as unknown as ILinkClient,
+        store,
+        "peer1",
+        { mode: "inbound", attemptGeneration: refreshedGeneration },
+      );
+
+      expect(refreshed).toEqual({ attempted: 1, delivered: 1, remaining: 0 });
+      expect(sendText).toHaveBeenCalledWith(
+        "peer1",
+        "wait for a new token",
+        "new-context",
+        "wegate-new-queued-id",
+      );
+    });
+  });
+
+  it("serializes concurrent flushes so a queued message is sent once", async () => {
+    await withStore(async (store) => {
+      store.enqueueOutbox("peer1", "send once");
+      const generation = store.upsertPeer("peer1", "fresh-context");
+      const send = deferred<void>();
+      const sendText = vi.fn(() => send.promise);
+      const client = { sendText } as unknown as ILinkClient;
+
+      const first = flushPendingOutbox(client, store, "peer1", {
+        mode: "inbound",
+        attemptGeneration: generation,
+      });
+      const second = flushPendingOutbox(client, store, "peer1", {
+        mode: "inbound",
+        attemptGeneration: generation,
+      });
+      await vi.waitFor(() => expect(sendText).toHaveBeenCalledOnce());
+      send.resolve();
+
+      await expect(first).resolves.toEqual({ attempted: 1, delivered: 1, remaining: 0 });
+      await expect(second).resolves.toEqual({ attempted: 0, delivered: 0, remaining: 0 });
+      expect(sendText).toHaveBeenCalledOnce();
+    });
+  });
+
+  it("persists a legacy client_id before attempting delivery", async () => {
+    await withStore(async (store) => {
+      const entry = store.enqueueOutbox("peer1", "legacy message");
+      const generation = store.upsertPeer("peer1", "fresh-context");
+      const savedClientIDs: Array<string | undefined> = [];
+      const originalSave = store.save.bind(store);
+      vi.spyOn(store, "save").mockImplementation(async () => {
+        savedClientIDs.push(store.listPendingOutbox("peer1")[0]?.client_id);
+        await originalSave();
+      });
+      const sendText = vi.fn(async () => { throw new Error("still pending"); });
+
+      await flushPendingOutbox(
+        { sendText } as unknown as ILinkClient,
+        store,
+        "peer1",
+        { mode: "inbound", attemptGeneration: generation },
+      );
+
+      const clientID = store.listPendingOutbox("peer1")[0]?.client_id;
+      expect(clientID).toMatch(/^wegate-/);
+      expect(savedClientIDs[0]).toBe(clientID);
+      expect(sendText).toHaveBeenCalledWith(
+        "peer1",
+        "legacy message",
+        "fresh-context",
+        clientID,
+      );
+      expect(entry.client_id).toBe(clientID);
+    });
+  });
+
+  it("keeps a near-capacity legacy replay bounded and redacts its failure log", async () => {
+    await withStore(async (store) => {
+      const secret = "legacy-secret-token";
+      const entry = {
+        id: "11111111-1111-4111-8111-111111111111",
+        peer_id: "peer1",
+        text: "",
+        queued_at: "2026-09-04T00:00:00.000Z",
+        attempts: 0,
+        last_error: "x".repeat(3_000),
+      };
+      const overhead = Buffer.byteLength(JSON.stringify([entry]), "utf8");
+      entry.text = "a".repeat(MAX_OUTBOX_BYTES - overhead);
+      expect(Buffer.byteLength(JSON.stringify([entry]), "utf8")).toBe(
+        MAX_OUTBOX_BYTES,
+      );
+      store.session.pending_outbox = [entry];
+      const originalText = entry.text;
+      const generation = store.upsertPeer("peer1", "fresh-context");
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const client = {
+        sendText: vi.fn(async () => {
+          throw new Error(`Authorization: Bearer ${secret}`);
+        }),
+      } as unknown as ILinkClient;
+
+      const result = await flushPendingOutbox(client, store, "peer1", {
+        mode: "inbound",
+        attemptGeneration: generation,
+      });
+
+      expect(result).toMatchObject({ attempted: 1, delivered: 0, remaining: 1 });
+      const pending = store.listPendingOutbox("peer1");
+      expect(pending[0]?.text).toBe(originalText);
+      expect(pending[0]?.client_id).toBe(`wegate-${entry.id}`);
+      expect(Buffer.byteLength(JSON.stringify(pending), "utf8")).toBeLessThanOrEqual(
+        MAX_OUTBOX_BYTES,
+      );
+      const logged = errorSpy.mock.calls.flat().map(String).join(" ");
+      expect(logged).not.toContain(secret);
+      expect(logged).toContain("[REDACTED]");
     });
   });
 
@@ -150,7 +301,7 @@ describe("pending outbox recovery", () => {
     });
   });
 
-  it("retries a tokenless legacy FIFO only after the next tokenless inbound", async () => {
+  it("retries a failed legacy FIFO after a later token-bearing inbound", async () => {
     await withStore(async (store) => {
       vi.spyOn(console, "log").mockImplementation(() => {});
       vi.spyOn(console, "error").mockImplementation(() => {});
@@ -179,7 +330,7 @@ describe("pending outbox recovery", () => {
         "second",
       ]);
 
-      const secondGeneration = store.upsertPeer("peer1");
+      const secondGeneration = store.upsertPeer("peer1", "new-context");
       const nextGeneration = await flushPendingOutbox(client, store, "peer1", {
         mode: "inbound",
         attemptGeneration: secondGeneration,
@@ -191,7 +342,7 @@ describe("pending outbox recovery", () => {
         "first",
         "second",
       ]);
-      expect(sendText.mock.calls.every(([, , token]) => token === undefined)).toBe(true);
+      expect(sendText.mock.calls.slice(1).every(([, , token]) => token === "new-context")).toBe(true);
       expect(store.listPendingOutbox("peer1")).toEqual([]);
       vi.restoreAllMocks();
     });

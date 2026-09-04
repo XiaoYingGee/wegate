@@ -97,28 +97,46 @@ Wegate persists each peer's latest `context_token` and, like Tencent's official
 `openclaw-weixin` channel, reuses it without imposing a local age limit. A
 persisted token is always sent to iLink. If no token has been captured yet,
 Wegate still attempts the send without one, matching the official channel.
-Wegate does not guess that a token has expired based on its age or on
-undocumented errors such as `ret=-2 prepare failed`.
+Wegate does not guess that a token has expired based on age. If a send that
+actually included a token receives the exact business response
+`code=-2, errmsg="prepare failed"`, it retries that same message once without
+the token and with the same `client_id`. Other errors are returned unchanged.
 
 `/api/send` uses these delivery semantics:
 
-- `200`: iLink accepted the message immediately (`delivered: true`).
+- `200`: iLink accepted the message, either immediately or through the fresh
+  token race recovery (`retried_after_inbound_refresh: true`).
+- `202`: the exact token-bound `-2/prepare failed` fallback was attempted and
+  its tokenless retry also failed; the message was persisted (`queued: true`)
+  until that peer supplies a new non-empty `context_token`.
 - `502`: iLink rejected the send, or a transport failure occurred; the real
-  upstream error is returned and the message is not queued. Ordinary sends use
-  a 15-second timeout; long-polling keeps its separate timeout behavior.
+  upstream error is returned and the message is not queued. This includes rate
+  limits, oversized messages, and every failure outside the exact fallback
+  condition. Each send attempt uses a 15-second timeout; the one permitted
+  fallback is a separate attempt. Long-polling keeps its own timeout behavior.
+- `507`: the bounded durable outbox is full (`outbox_capacity_exceeded`).
 
-New `/api/send` requests are never queued before contacting iLink. Releases
-that used the former local-expiry heuristic may already have messages in the
-persisted outbox. During startup, each peer's entries are attempted in FIFO
-order. Delivery stops at that peer's first real upstream failure, preserving
-the failed entry and every later entry for a future recovery attempt.
+New `/api/send` requests are never queued before contacting iLink. A message is
+queued only after both the exact token-bound fallback condition and its single
+tokenless retry fail. Its failed token generation is persisted, so restart does
+not immediately retry it with the same stale context. A later inbound message
+for that peer must contain a new non-empty token before FIFO recovery runs.
+If that token arrives while the original request is still in flight, Wegate
+detects the newer generation after enqueueing and immediately attempts the same
+FIFO flush, closing the missed-notification race. All flushes for one peer are
+serialized. The original `client_id` is persisted and reused on every replay so
+an uncertain timeout cannot create a new message identity. Stored error details
+are bounded and credential-redacted.
+Delivery stops at the first replay failure, preserving that entry and all later
+entries in order. Startup recovery only forces legacy entries from older
+releases that have no recorded attempt generation.
 
 `/api/status` reports the persisted login session separately from
 `outbound_ready` (`connection_basis: "persisted_session"`). A known peer is
 outbound-ready even without a token because iLink is still attempted.
 `context_token_available` reports whether a token will be included, while
 `token_updated_at` is informational and is not an expiry time. Pending outbox
-counts refer only to legacy recovery entries.
+counts include both legacy recovery entries and failed tokenless fallbacks.
 
 ### Push notification example
 

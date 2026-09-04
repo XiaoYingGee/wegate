@@ -76,7 +76,7 @@ async function main(): Promise<void> {
   await flushLegacyPendingOutbox(client, store, allowedSenders);
 
   // 6. Start message loop
-  startMessageLoop(client, store, async (from, text, _msg, inboundGeneration) => {
+  startMessageLoop(client, store, async (from, text, msg, inboundGeneration) => {
     log(`← [${from}] ${text}`);
 
     // Sender whitelist gate: must run before ANY routing (including #commands,
@@ -94,6 +94,7 @@ async function main(): Promise<void> {
       from,
       allowedSenders,
       inboundGeneration,
+      msg.context_token,
     );
     if (flushed && flushed.attempted > 0) {
       log(
@@ -250,15 +251,17 @@ export function isSenderAllowed(from: string, allowedSenders: string[] | undefin
   return allowedSenders.includes(from);
 }
 
-/** Defense-in-depth wrapper: callers must not flush an unauthorized peer. */
+/** Flush only for an authorized peer whose current inbound carried a token. */
 export async function flushAllowedPendingOutbox(
   client: ILinkClient,
   store: SessionStore,
   from: string,
   allowedSenders: string[] | undefined,
   inboundGeneration: number,
+  contextToken?: string,
 ) {
   if (!isSenderAllowed(from, allowedSenders)) return undefined;
+  if (!contextToken?.trim()) return undefined;
   return flushPendingOutbox(client, store, from, {
     mode: "inbound",
     attemptGeneration: inboundGeneration,

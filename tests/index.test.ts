@@ -51,6 +51,27 @@ describe("isSenderAllowed (BUG-5 sender whitelist)", () => {
     expect(sendText).not.toHaveBeenCalled();
   });
 
+  it("does not flush pending messages for a tokenless inbound", async () => {
+    const sendText = vi.fn();
+    const store = {
+      getPeerOutboundStatus: vi.fn(() => {
+        throw new Error("outbox must wait for a new token");
+      }),
+    } as unknown as SessionStore;
+
+    const result = await flushAllowedPendingOutbox(
+      { sendText } as unknown as ILinkClient,
+      store,
+      "alice",
+      undefined,
+      2,
+      "   ",
+    );
+
+    expect(result).toBeUndefined();
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
   it("recovers authorized legacy outbox entries at startup without inbound", async () => {
     const dir = await mkdtemp(resolve(tmpdir(), "wegate-index-test-"));
     try {
@@ -69,7 +90,12 @@ describe("isSenderAllowed (BUG-5 sender whitelist)", () => {
       );
 
       expect(sendText).toHaveBeenCalledOnce();
-      expect(sendText).toHaveBeenCalledWith("alice", "allowed legacy message", undefined);
+      expect(sendText).toHaveBeenCalledWith(
+        "alice",
+        "allowed legacy message",
+        undefined,
+        expect.stringMatching(/^wegate-/),
+      );
       expect(store.listPendingOutbox("alice")).toEqual([]);
       expect(store.listPendingOutbox("mallory")).toHaveLength(1);
       vi.restoreAllMocks();

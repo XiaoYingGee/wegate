@@ -4,6 +4,7 @@ import {
   ILinkClient,
   ILinkSendError,
   ILinkTimeoutError,
+  isTokenlessFallbackFailure,
 } from "../src/client/ilink.js";
 
 describe("ILinkClient", () => {
@@ -150,9 +151,37 @@ describe("ILinkClient", () => {
     vi.restoreAllMocks();
   });
 
-  it("preserves ret=-2 prepare failed as a generic upstream send error", async () => {
+  it("retries exactly once without context_token for token-bound -2 prepare failed", async () => {
+    const requestBodies: Array<{ msg: Record<string, unknown> }> = [];
+    vi.spyOn(globalThis, "fetch")
+      .mockImplementationOnce(async (_url, init) => {
+        requestBodies.push(JSON.parse(init?.body as string));
+        return new Response(JSON.stringify({ errcode: 0, ret: -2, errmsg: "prepare failed" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      })
+      .mockImplementationOnce(async (_url, init) => {
+        requestBodies.push(JSON.parse(init?.body as string));
+        return new Response(JSON.stringify({ ret: 0 }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      });
+
+    const client = new ILinkClient("https://example.com", "tok");
+    await expect(client.sendText("peer1", "hello", "ctx")).resolves.toBeUndefined();
+
+    expect(requestBodies).toHaveLength(2);
+    expect(requestBodies[0]?.msg.context_token).toBe("ctx");
+    expect(requestBodies[1]?.msg).not.toHaveProperty("context_token");
+    expect(requestBodies[1]?.msg.client_id).toBe(requestBodies[0]?.msg.client_id);
+    expect(requestBodies[1]?.msg.item_list).toEqual(requestBodies[0]?.msg.item_list);
+  });
+
+  it("does not retry tokenless -2 prepare failed", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
       new Response(JSON.stringify({ ret: -2, errmsg: "prepare failed" }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -160,12 +189,87 @@ describe("ILinkClient", () => {
     );
 
     const client = new ILinkClient("https://example.com", "tok");
+    const error = await client.sendText("peer1", "hello").catch((err) => err);
+    expect(error).toMatchObject({ code: -2, upstreamMessage: "prepare failed" });
+    expect(isTokenlessFallbackFailure(error)).toBe(false);
+    expect(fetchSpy).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { response: { ret: -2, errmsg: "rate limit" }, label: "rate limit" },
+    { response: { ret: -2, errmsg: "message too long" }, label: "oversize" },
+    { response: { ret: -2, errmsg: "Prepare failed" }, label: "different case" },
+    { response: { ret: -2, errmsg: "prepare failed " }, label: "trailing whitespace" },
+    { response: { ret: 429, errmsg: "prepare failed" }, label: "other code" },
+  ])("does not blanket-fallback for $label errors", async ({ response }) => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+      new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    const client = new ILinkClient("https://example.com", "tok");
+    await expect(client.sendText("peer1", "hello", "ctx")).rejects.toBeInstanceOf(
+      ILinkSendError,
+    );
+    expect(fetchSpy).toHaveBeenCalledOnce();
+  });
+
+  it("throws the real tokenless retry error when fallback also fails", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const requestBodies: Array<{ msg: { client_id: string } }> = [];
+    const responses = [
+      { ret: -2, errmsg: "prepare failed" },
+      { ret: 10008, errmsg: "request rejected" },
+      { ret: 0 },
+    ];
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (_url, init) => {
+        requestBodies.push(JSON.parse(init?.body as string));
+        return new Response(JSON.stringify(responses.shift()), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    );
+
+    const client = new ILinkClient("https://example.com", "tok");
+    const error = await client.sendText("peer1", "hello", "ctx").catch((err) => err);
+    expect(error).toMatchObject({
+      code: 10008,
+      upstreamMessage: "request rejected",
+    });
+    expect(isTokenlessFallbackFailure(error)).toBe(true);
+    await expect(
+      client.sendText(
+        "peer1",
+        "hello",
+        "fresh-context",
+        error.tokenlessFallbackClientId,
+      ),
+    ).resolves.toBeUndefined();
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+    expect(new Set(requestBodies.map(({ msg }) => msg.client_id)).size).toBe(1);
+  });
+
+  it("preserves and marks a tokenless retry transport error", async () => {
+    const transportError = new Error("tokenless network failure");
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ ret: -2, errmsg: "prepare failed" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      )
+      .mockRejectedValueOnce(transportError);
+
+    const client = new ILinkClient("https://example.com", "tok");
     const error = await client.sendText("peer1", "hello", "ctx").catch((err) => err);
 
-    expect(error).toBeInstanceOf(ILinkSendError);
-    expect(error).toMatchObject({ code: -2, upstreamMessage: "prepare failed" });
-
-    vi.restoreAllMocks();
+    expect(error).toBe(transportError);
+    expect(isTokenlessFallbackFailure(error)).toBe(true);
   });
 
   it("throws when only `ret` (not errcode) signals failure", async () => {
@@ -188,7 +292,7 @@ describe("ILinkClient", () => {
   it("does not let errcode=0 mask a non-zero ret", async () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      new Response(JSON.stringify({ errcode: 0, ret: -2, errmsg: "prepare failed" }), {
+      new Response(JSON.stringify({ errcode: 0, ret: -2, errmsg: "rate limit" }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       }),

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   MAX_OUTBOX_BYTES,
+  MAX_OUTBOX_ERROR_BYTES,
   MAX_OUTBOX_MESSAGES,
   OutboxCapacityError,
   SessionStore,
@@ -85,6 +86,7 @@ describe("SessionStore", () => {
         contextTokenAvailable: true,
         tokenUpdatedAt: before.tokenUpdatedAt,
         tokenGeneration: before.tokenGeneration + 1,
+        tokenRefreshGeneration: before.tokenRefreshGeneration,
       });
     });
   });
@@ -228,26 +230,82 @@ describe("SessionStore", () => {
     });
   });
 
+  it("persists the failed token generation for newly queued fallback failures", async () => {
+    await withTempStore(async (store, path) => {
+      const entry = store.enqueueOutbox("peer1", "queued reminder", {
+        generation: 7,
+        error: "tokenless request rejected",
+        clientId: "wegate-persisted-client-id",
+      });
+      await store.save();
+
+      const reloaded = new SessionStore(path);
+      await reloaded.load();
+      expect(reloaded.listPendingOutbox("peer1")).toEqual([
+        expect.objectContaining({
+          id: entry.id,
+          attempts: 1,
+          last_attempt_generation: 7,
+          last_error: "tokenless request rejected",
+          client_id: "wegate-persisted-client-id",
+        }),
+      ]);
+    });
+  });
+
+  it("bounds and redacts all persisted outbox errors", async () => {
+    await withTempStore(async (store) => {
+      const secret = "super-secret-token-value";
+      const entry = store.enqueueOutbox("peer1", "queued reminder", {
+        generation: 2,
+        clientId: "wegate-redaction-id",
+        error:
+          `Authorization: Bearer ${secret} context_token=${secret} ` +
+          "你".repeat(MAX_OUTBOX_ERROR_BYTES * 3),
+      });
+
+      expect(entry.last_error).not.toContain(secret);
+      expect(entry.last_error).toContain("[REDACTED]");
+      expect(Buffer.byteLength(entry.last_error || "", "utf8")).toBeLessThanOrEqual(
+        MAX_OUTBOX_ERROR_BYTES,
+      );
+
+      store.markOutboxFailure(
+        entry.id,
+        `{"bot_token":"${secret}","password":"${secret}"}`,
+      );
+      expect(store.listPendingOutbox()[0]?.last_error).not.toContain(secret);
+    });
+  });
+
   it("caps the durable outbox instead of growing the session file forever", async () => {
     await withTempStore(async (store) => {
       for (let i = 0; i < MAX_OUTBOX_MESSAGES; i += 1) {
         store.enqueueOutbox("peer1", `message-${i}`);
       }
+      expect(
+        Buffer.byteLength(JSON.stringify(store.listPendingOutbox()), "utf8"),
+      ).toBeLessThanOrEqual(MAX_OUTBOX_BYTES);
+      const last = store.listPendingOutbox().at(-1)!;
+      store.markOutboxFailure(last.id, "token=" + "z".repeat(20_000));
+      expect(
+        Buffer.byteLength(JSON.stringify(store.listPendingOutbox()), "utf8"),
+      ).toBeLessThanOrEqual(MAX_OUTBOX_BYTES);
       expect(() => store.enqueueOutbox("peer1", "one too many")).toThrow(
         OutboxCapacityError,
       );
     });
   });
 
-  it("accepts exactly 5 MiB of UTF-8 message text and rejects one byte more", async () => {
+  it("counts serialized metadata, not only text, toward the 5 MiB limit", async () => {
     await withTempStore(async (store) => {
-      const threeByteChars = Math.floor(MAX_OUTBOX_BYTES / 3);
-      const remainder = MAX_OUTBOX_BYTES % 3;
-      const exactLimit = "你".repeat(threeByteChars) + "a".repeat(remainder);
-      expect(Buffer.byteLength(exactLimit, "utf8")).toBe(MAX_OUTBOX_BYTES);
-
-      expect(() => store.enqueueOutbox("peer1", exactLimit)).not.toThrow();
-      expect(() => store.enqueueOutbox("peer1", "b")).toThrow(OutboxCapacityError);
+      const textBelowLimit = "a".repeat(MAX_OUTBOX_BYTES - 32);
+      expect(Buffer.byteLength(textBelowLimit, "utf8")).toBeLessThan(
+        MAX_OUTBOX_BYTES,
+      );
+      expect(() => store.enqueueOutbox("peer1", textBelowLimit)).toThrow(
+        OutboxCapacityError,
+      );
     });
   });
 });

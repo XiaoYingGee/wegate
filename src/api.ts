@@ -1,7 +1,15 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import type { ILinkClient } from "./client/ilink.js";
-import type { SessionStore } from "./store/session.js";
+import {
+  isTokenlessFallbackFailure,
+  type ILinkClient,
+} from "./client/ilink.js";
+import {
+  OutboxCapacityError,
+  sanitizeOutboxError,
+  type SessionStore,
+} from "./store/session.js";
+import { flushPendingOutbox } from "./outbox.js";
 import type { Router } from "./router.js";
 
 const log = (msg: string, ...args: unknown[]) =>
@@ -180,16 +188,91 @@ async function handleSend(
     });
   }
 
+  const outboundStatus = store.getPeerOutboundStatus(to);
   try {
     // Match Tencent/openclaw-weixin: a known peer is always attempted. The
     // latest persisted context_token is included when available, but its age
     // and absence are not local reasons to suppress the upstream request.
-    await client.sendText(to, text, store.getPeerToken(to));
+    await client.sendText(to, text, outboundStatus.contextToken);
     log(`/api/send 成功 → [${to}]: "${summary}"`);
     jsonResponse(res, 200, { delivered: true, queued: false, to, text });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    logError(`/api/send 失败 → [${to}]: "${summary}" — ${msg}`);
+    const safeMessage = sanitizeOutboxError(msg);
+    if (outboundStatus.contextToken && isTokenlessFallbackFailure(err)) {
+      let entry: ReturnType<SessionStore["enqueueOutbox"]> | undefined;
+      try {
+        entry = store.enqueueOutbox(to, text, {
+          generation: outboundStatus.tokenGeneration,
+          error: msg,
+          clientId: err.tokenlessFallbackClientId,
+        });
+        try {
+          await store.save();
+        } catch (saveErr) {
+          store.removeOutbox(entry.id);
+          throw saveErr;
+        }
+      } catch (queueErr) {
+        const queueMessage = queueErr instanceof Error
+          ? queueErr.message
+          : String(queueErr);
+        logError(
+          `/api/send 入队失败 → [${to}]: "${summary}" — ${sanitizeOutboxError(queueMessage)}`,
+        );
+        if (queueErr instanceof OutboxCapacityError) {
+          return jsonResponse(res, 507, {
+            code: "outbox_capacity_exceeded",
+            error: queueMessage,
+          });
+        }
+        return jsonResponse(res, 502, {
+          error: `send failed: ${msg}; queue failed: ${queueMessage}`,
+        });
+      }
+
+      const currentStatus = store.getPeerOutboundStatus(to);
+      if (
+        currentStatus.contextToken &&
+        currentStatus.tokenRefreshGeneration > outboundStatus.tokenGeneration
+      ) {
+        try {
+          await flushPendingOutbox(client, store, to, {
+            mode: "inbound",
+            attemptGeneration: currentStatus.tokenGeneration,
+          });
+        } catch (flushErr) {
+          const flushMessage = flushErr instanceof Error
+            ? flushErr.message
+            : String(flushErr);
+          logError(
+            `/api/send 入队后即时补发异常 → [${to}]: ${sanitizeOutboxError(flushMessage)}`,
+          );
+        }
+        if (!store.listPendingOutbox(to).some((item) => item.id === entry.id)) {
+          log(`/api/send 新 token 补发成功 → [${to}]: "${summary}"`);
+          return jsonResponse(res, 200, {
+            delivered: true,
+            queued: false,
+            retried_after_inbound_refresh: true,
+            to,
+            text,
+          });
+        }
+      }
+
+      log(
+        `/api/send 已排队 → [${to}] queue_id=${entry.id}，等待新 context_token: "${summary}"`,
+      );
+      return jsonResponse(res, 202, {
+        delivered: false,
+        queued: true,
+        queue_id: entry.id,
+        to,
+        text,
+      });
+    }
+    logError(`/api/send 失败 → [${to}]: "${summary}" — ${safeMessage}`);
     jsonResponse(res, 502, { error: `send failed: ${msg}` });
   }
 }

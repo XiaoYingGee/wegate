@@ -11,11 +11,23 @@ import {
   ILinkTimeoutError,
   type ILinkClient,
 } from "../src/client/ilink.js";
+import { flushPendingOutbox } from "../src/outbox.js";
+import { MAX_OUTBOX_MESSAGES } from "../src/store/session.js";
 
 interface SendCall {
   to: string;
   text: string;
   token?: string;
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 function makeClient(sendCalls: SendCall[], shouldFail = false): ILinkClient {
@@ -36,6 +48,7 @@ async function withServer(
   const router = overrides.router ?? new Router();
   const sendCalls: SendCall[] = [];
   const client = overrides.client ?? makeClient(sendCalls);
+  overrides.onDir?.(dir);
 
   const server = startApiServer(
     {
@@ -158,6 +171,32 @@ describe("BUG-4: /api/send logs success and failure", () => {
       spy.mockRestore();
     });
   });
+
+  it("redacts upstream secrets from failure logs while preserving the HTTP diagnostic", async () => {
+    const secret = "api-log-secret-token";
+    const client = {
+      sendText: vi.fn(async () => {
+        throw new Error(`Authorization: Bearer ${secret}`);
+      }),
+    } as unknown as ILinkClient;
+
+    await withServer({ client }, async (baseUrl, { store }) => {
+      store.upsertPeer("peer1", "token");
+      const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const response = await fetch(`${baseUrl}/api/send`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: "peer1", text: "hello" }),
+      });
+
+      expect(response.status).toBe(502);
+      expect((await response.json()).error).toContain(secret);
+      const logged = spy.mock.calls.flat().map(String).join(" ");
+      expect(logged).not.toContain(secret);
+      expect(logged).toContain("[REDACTED]");
+      spy.mockRestore();
+    });
+  });
 });
 
 describe("BUG-14: /api/send 'to' fallback uses most-recent peer, not currentPeer", () => {
@@ -232,7 +271,7 @@ describe("proactive delivery and legacy outbox status", () => {
     });
   });
 
-  it("returns ret=-2 prepare failed as the real upstream error without queueing", async () => {
+  it("does not queue an unmarked upstream -2 prepare failed error", async () => {
     const sendText = vi.fn(async () => {
       throw new ILinkSendError(-2, "prepare failed");
     });
@@ -261,6 +300,198 @@ describe("proactive delivery and legacy outbox status", () => {
       expect(second.status).toBe(502);
       expect(sendText).toHaveBeenCalledTimes(2);
       expect(store.listPendingOutbox("peer1")).toHaveLength(0);
+    });
+  });
+
+  it("persists and returns 202 when the tokenless fallback also fails", async () => {
+    const finalError = Object.assign(
+      new ILinkSendError(10008, "tokenless request rejected"),
+      {
+        tokenlessFallbackAttempted: true as const,
+        tokenlessFallbackClientId: "wegate-stable-api-id",
+      },
+    );
+    const client = {
+      sendText: vi.fn(async () => {
+        throw finalError;
+      }),
+    } as unknown as ILinkClient;
+    let sessionDir = "";
+
+    await withServer(
+      { client, onDir: (dir) => { sessionDir = dir; } },
+      async (baseUrl, { store }) => {
+        const generation = store.upsertPeer("peer1", "stale-token");
+        const res = await fetch(`${baseUrl}/api/send`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ to: "peer1", text: "queued reminder" }),
+        });
+
+        expect(res.status).toBe(202);
+        await expect(res.json()).resolves.toMatchObject({
+          delivered: false,
+          queued: true,
+          to: "peer1",
+          text: "queued reminder",
+          queue_id: expect.any(String),
+        });
+        expect(store.listPendingOutbox("peer1")).toEqual([
+          expect.objectContaining({
+            text: "queued reminder",
+            attempts: 1,
+            last_attempt_generation: generation,
+            last_error: expect.stringMatching(/tokenless request rejected/),
+            client_id: "wegate-stable-api-id",
+          }),
+        ]);
+
+        const reloaded = new SessionStore(resolve(sessionDir, "session.json"));
+        await reloaded.load();
+        expect(reloaded.listPendingOutbox("peer1")).toHaveLength(1);
+      },
+    );
+  });
+
+  it("immediately flushes a just-queued fallback failure when a newer token arrived during send", async () => {
+    const pendingSend = deferred<void>();
+    const finalError = Object.assign(
+      new Error("tokenless transport uncertainty"),
+      {
+        tokenlessFallbackAttempted: true as const,
+        tokenlessFallbackClientId: "wegate-race-client-id",
+      },
+    );
+    const sendText = vi
+      .fn()
+      .mockImplementationOnce(() => pendingSend.promise)
+      .mockResolvedValueOnce(undefined);
+    const client = { sendText } as unknown as ILinkClient;
+
+    await withServer({ client }, async (baseUrl, { store }) => {
+      store.upsertPeer("peer1", "old-token");
+      const responsePromise = fetch(`${baseUrl}/api/send`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: "peer1", text: "race reminder" }),
+      });
+      await vi.waitFor(() => expect(sendText).toHaveBeenCalledTimes(1));
+
+      const freshGeneration = store.upsertPeer("peer1", "fresh-token");
+      expect(await flushPendingOutbox(client, store, "peer1", {
+        mode: "inbound",
+        attemptGeneration: freshGeneration,
+      })).toEqual({ attempted: 0, delivered: 0, remaining: 0 });
+
+      pendingSend.reject(finalError);
+      const response = await responsePromise;
+      expect(response.status).toBe(200);
+      await expect(response.json()).resolves.toMatchObject({
+        delivered: true,
+        queued: false,
+        retried_after_inbound_refresh: true,
+      });
+      expect(sendText.mock.calls[1]).toEqual([
+        "peer1",
+        "race reminder",
+        "fresh-token",
+        "wegate-race-client-id",
+      ]);
+      expect(store.listPendingOutbox("peer1")).toEqual([]);
+    });
+  });
+
+  it("keeps FIFO and returns 202 when an older pending head failed on the new token", async () => {
+    const pendingSend = deferred<void>();
+    const finalError = Object.assign(
+      new Error("tokenless transport uncertainty"),
+      {
+        tokenlessFallbackAttempted: true as const,
+        tokenlessFallbackClientId: "wegate-current-client-id",
+      },
+    );
+    const sendText = vi
+      .fn()
+      .mockImplementationOnce(() => pendingSend.promise)
+      .mockRejectedValueOnce(new Error("older head still failing"));
+    const client = { sendText } as unknown as ILinkClient;
+
+    await withServer({ client }, async (baseUrl, { store }) => {
+      store.upsertPeer("peer1", "old-token");
+      store.enqueueOutbox("peer1", "older pending");
+      const responsePromise = fetch(`${baseUrl}/api/send`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: "peer1", text: "current reminder" }),
+      });
+      await vi.waitFor(() => expect(sendText).toHaveBeenCalledTimes(1));
+
+      const freshGeneration = store.upsertPeer("peer1", "fresh-token");
+      const priorFlush = await flushPendingOutbox(client, store, "peer1", {
+        mode: "inbound",
+        attemptGeneration: freshGeneration,
+      });
+      expect(priorFlush).toMatchObject({ attempted: 1, delivered: 0, remaining: 1 });
+
+      pendingSend.reject(finalError);
+      const response = await responsePromise;
+      expect(response.status).toBe(202);
+      expect(store.listPendingOutbox("peer1").map((entry) => entry.text)).toEqual([
+        "older pending",
+        "current reminder",
+      ]);
+      expect(sendText).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("rolls back the in-memory entry when persistence fails", async () => {
+    const finalError = Object.assign(new Error("tokenless failure"), {
+      tokenlessFallbackAttempted: true as const,
+      tokenlessFallbackClientId: "wegate-save-failure-id",
+    });
+    const client = {
+      sendText: vi.fn(async () => { throw finalError; }),
+    } as unknown as ILinkClient;
+
+    await withServer({ client }, async (baseUrl, { store }) => {
+      store.upsertPeer("peer1", "stale-token");
+      vi.spyOn(store, "save").mockRejectedValueOnce(new Error("disk unavailable"));
+      const response = await fetch(`${baseUrl}/api/send`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: "peer1", text: "do not retain" }),
+      });
+
+      expect(response.status).toBe(502);
+      expect(store.listPendingOutbox("peer1")).toEqual([]);
+    });
+  });
+
+  it("returns 507 when the durable outbox is at capacity", async () => {
+    const finalError = Object.assign(new Error("tokenless failure"), {
+      tokenlessFallbackAttempted: true as const,
+      tokenlessFallbackClientId: "wegate-capacity-id",
+    });
+    const client = {
+      sendText: vi.fn(async () => { throw finalError; }),
+    } as unknown as ILinkClient;
+
+    await withServer({ client }, async (baseUrl, { store }) => {
+      store.upsertPeer("peer1", "stale-token");
+      for (let index = 0; index < MAX_OUTBOX_MESSAGES; index += 1) {
+        store.enqueueOutbox("peer1", `queued-${index}`);
+      }
+      const response = await fetch(`${baseUrl}/api/send`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: "peer1", text: "over capacity" }),
+      });
+
+      expect(response.status).toBe(507);
+      await expect(response.json()).resolves.toMatchObject({
+        code: "outbox_capacity_exceeded",
+      });
+      expect(store.listPendingOutbox("peer1")).toHaveLength(MAX_OUTBOX_MESSAGES);
     });
   });
 

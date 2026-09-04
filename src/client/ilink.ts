@@ -63,8 +63,8 @@ export interface SendMessageResponse {
 /**
  * iLink can return HTTP 200 while rejecting the message at the protocol layer.
  * Keep the numeric code machine-readable for diagnostics. The official
- * client treats any non-zero `ret` as an upstream send failure; Wegate must
- * not infer context-token expiry from undocumented codes or message text.
+ * client treats any non-zero `ret` as an upstream send failure. Wegate only
+ * applies its narrowly-scoped tokenless fallback inside `sendText`.
  */
 export class ILinkSendError extends Error {
   readonly code: number;
@@ -89,6 +89,21 @@ export class ILinkTimeoutError extends Error {
     this.path = path;
     this.timeoutMs = timeoutMs;
   }
+}
+
+export type TokenlessFallbackFailure = Error & {
+  tokenlessFallbackAttempted: true;
+  tokenlessFallbackClientId: string;
+};
+
+/** Whether this is the original error thrown by a failed tokenless retry. */
+export function isTokenlessFallbackFailure(
+  err: unknown,
+): err is TokenlessFallbackFailure {
+  return (
+    err instanceof Error &&
+    (err as TokenlessFallbackFailure).tokenlessFallbackAttempted === true
+  );
 }
 
 // ── Client ──
@@ -162,41 +177,62 @@ export class ILinkClient {
     toUserID: string,
     text: string,
     contextToken?: string,
+    stableClientID?: string,
   ): Promise<void> {
     // 微信客户端不识别 \n/\r\n 作为换行（实测挤成一行），
     // U+2028 (LINE SEPARATOR) 是实测唯一能在手机/电脑微信都正确换行的编码。
     const wechatText = text.replace(/\r\n|\r|\n/g, " ");
-    const body = {
-      msg: {
-        from_user_id: "",
-        to_user_id: toUserID,
-        client_id: `wegate-${randomUUID()}`,
-        message_type: 2,
-        message_state: 2,
-        context_token: contextToken || undefined,
-        item_list: [{ type: 1, text_item: { text: wechatText } }],
-      },
-    };
+    const clientID = stableClientID || `wegate-${randomUUID()}`;
+    const send = (token?: string) =>
+      this.postJSON<SendMessageResponse>(
+        "/ilink/bot/sendmessage",
+        {
+          msg: {
+            from_user_id: "",
+            to_user_id: toUserID,
+            client_id: clientID,
+            message_type: 2,
+            message_state: 2,
+            context_token: token || undefined,
+            item_list: [{ type: 1, text_item: { text: wechatText } }],
+          },
+        },
+        undefined,
+        DEFAULT_SEND_TIMEOUT_MS,
+      );
 
-    const resp = await this.postJSON<SendMessageResponse>(
-      "/ilink/bot/sendmessage",
-      body,
-      undefined,
-      DEFAULT_SEND_TIMEOUT_MS,
-    );
+    let resp = await send(contextToken);
+    let businessCode = getSendBusinessCode(resp);
+    let tokenlessFallbackAttempted = false;
+
+    // A context_token can remain persisted after iLink no longer accepts it.
+    // Hermes confirmed that the same message succeeds tokenless in this exact
+    // upstream state. Retry once without changing the idempotency client_id.
+    if (
+      contextToken &&
+      businessCode === -2 &&
+      resp.errmsg === "prepare failed"
+    ) {
+      tokenlessFallbackAttempted = true;
+      try {
+        resp = await send();
+      } catch (err) {
+        markTokenlessFallbackFailure(err, clientID);
+      }
+      businessCode = getSendBusinessCode(resp);
+    }
 
     // Some iLink variants return both fields (for example errcode=0 with a
     // non-zero ret). Any non-zero business code must win over a zero alias.
-    const businessCode =
-      (resp.errcode !== undefined && resp.errcode !== 0 ? resp.errcode : undefined) ??
-      (resp.ret !== undefined && resp.ret !== 0 ? resp.ret : undefined) ??
-      resp.errcode ??
-      resp.ret;
     if (businessCode) {
       logError(
-        `sendmessage 被 iLink 拒绝: code=${businessCode} errmsg=${resp.errmsg ?? ""} to=${toUserID}`,
+        `sendmessage 被 iLink 拒绝: code=${businessCode} to=${toUserID}`,
       );
-      throw new ILinkSendError(businessCode, resp.errmsg);
+      const error = new ILinkSendError(businessCode, resp.errmsg);
+      if (tokenlessFallbackAttempted) {
+        markTokenlessFallbackFailure(error, clientID);
+      }
+      throw error;
     }
   }
 
@@ -265,6 +301,29 @@ export class ILinkClient {
     }
     return headers;
   }
+}
+
+function getSendBusinessCode(resp: SendMessageResponse): number | undefined {
+  return (
+    (resp.errcode !== undefined && resp.errcode !== 0 ? resp.errcode : undefined) ??
+    (resp.ret !== undefined && resp.ret !== 0 ? resp.ret : undefined) ??
+    resp.errcode ??
+    resp.ret
+  );
+}
+
+function markTokenlessFallbackFailure(err: unknown, clientID: string): never {
+  if (err instanceof Error) {
+    Object.defineProperty(err, "tokenlessFallbackAttempted", {
+      value: true,
+      configurable: true,
+    });
+    Object.defineProperty(err, "tokenlessFallbackClientId", {
+      value: clientID,
+      configurable: true,
+    });
+  }
+  throw err;
 }
 
 function randomWechatUIN(): string {
